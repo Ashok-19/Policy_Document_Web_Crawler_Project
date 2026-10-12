@@ -477,9 +477,17 @@ class PayerCrawler:
                 if sc >= threshold:
                     self._enqueue_doc(l.url, kind, sc, sig, page_url, path, depth, l.anchor, l.heading, page_ctx, hints, route)
                 elif sc > -3:
-                    self.db.skip_link(self.name, l.url, page_url, l.anchor, sc, hub_score,
-                                      "external_host_low_score" if external else "low_score")
-                continue
+                    threshold_val = DOC_CANDIDATE_MIN_SCORE if kind == "doc" else MAYBE_DOC_MIN_SCORE
+                    if external:
+                        threshold_val = max(threshold_val, EXTERNAL_DOC_MIN_SCORE)
+                    
+                    reason_text = (f"Link score ({sc:.2f}) is below the minimum threshold ({threshold_val:.2f}) "
+                                f"required for {'an external host' if external else 'this document type'}. "
+                                f"Anchor text: '{clean_anchor(l.anchor)[:100]}'.")
+                    
+                    self.db.skip_link(self.name, l.url, page_url, l.anchor, sc, hub_score, reason_text, l.heading, page_ctx)
+                    continue
+            
             if kind == "sitemap" or budget <= 0 or depth > MAX_DEPTH:
                 continue
             if in_scope:
@@ -848,13 +856,24 @@ class PayerCrawler:
 # =============================================================================
 # 16. EXPORT - URL de-duplication, near-duplicate collapse, revisions, run summary, QA
 # =============================================================================
-REMOVED_COLUMNS = ["payer_name", "rule", "kept_document_url", "removed_document_url", "content_hash_sha256", "detail"]
+REMOVED_COLUMNS = [
+    "payer_name", "rule", "reason", "kept_document_url", "kept_title", "kept_confidence",
+    "removed_document_url", "removed_title", "removed_confidence", "content_hash_sha256"
+]
 
-
-def _removed(keep: dict, r: dict, rule: str, detail: str = "") -> dict:
-    return {"payer_name": r["payer_name"], "rule": rule, "kept_document_url": keep["document_url"],
-            "removed_document_url": r["document_url"], "content_hash_sha256": r.get("content_hash_sha256", ""), "detail": detail}
-
+def _removed(keep: dict, r: dict, rule: str, reason: str = "") -> dict:
+    return {
+        "payer_name": r["payer_name"],
+        "rule": rule,
+        "reason": reason,
+        "kept_document_url": keep["document_url"],
+        "kept_title": keep.get("document_title", ""),
+        "kept_confidence": keep.get("confidence_score", ""),
+        "removed_document_url": r["document_url"],
+        "removed_title": r.get("document_title", ""),
+        "removed_confidence": r.get("confidence_score", ""),
+        "content_hash_sha256": r.get("content_hash_sha256", "")
+    }
 
 def _completeness(r: dict) -> int:
     return sum(bool(r[c]) for c in ("policy_number", "effective_date", "last_updated_date"))
@@ -897,7 +916,7 @@ def _merge_into(keep: dict, others: list[dict]) -> None:
     _add_note(keep, f"same document also at {len(urls)} other URL(s): {shown}")
 
 
-def _collapse(rows: list[dict], keyfn: Callable[[dict], Any], rule: str, removed: list[dict]) -> list[dict]:
+def _collapse(rows: list[dict], keyfn: Callable[[dict], Any], rule: str, reason: str, removed: list[dict]) -> list[dict]:
     groups: dict[Any, list[dict]] = defaultdict(list)
     for r in rows:
         k = keyfn(r)
@@ -912,7 +931,7 @@ def _collapse(rows: list[dict], keyfn: Callable[[dict], Any], rule: str, removed
         _merge_into(keep, others)
         for o in others:
             drop.add(id(o))
-            removed.append(_removed(keep, o, rule))
+            removed.append(_removed(keep, o, rule, reason))
     return [r for r in rows if id(r) not in drop]
 
 
@@ -975,7 +994,8 @@ def _revisions(rows: list[dict], removed: list[dict]) -> list[dict]:
                 status = f"superseded by {latest[0]['document_url']}"
             if REVISION_POLICY == "latest_only" and d and d < top and len(latest) == 1:
                 drop.add(id(r))
-                removed.append(_removed(latest[0], r, "superseded_revision", f"{label}: {fld} {d} < {top}"))
+                reason_text = f"Superseded by a newer revision. The kept document is dated {top} (field: {fld or 'n/a'})."
+                removed.append(_removed(latest[0], r, "superseded_revision", reason_text))
                 continue
             _add_note(r, f"revision group ({len(g)} versions of {label}, compared on {fld or 'n/a'}): {status}")
     return [r for r in rows if id(r) not in drop]
@@ -1004,16 +1024,19 @@ def build_rows(db: StateDB) -> tuple[list[dict], list[dict]]:
         k = url_key(r["document_url"])
         if k in seen:
             keep = seen[k]
-            removed.append(_removed(keep, r, "same_url_key" if keep["payer_name"] == r["payer_name"] else "same_url_key_cross_payer"))
+            rule_name = "same_url_key" if keep["payer_name"] == r["payer_name"] else "same_url_key_cross_payer"
+            reason_text = "Identical URL path/query (ignoring tracking parameters, case, and www). Kept the highest-ranked version."
+            removed.append(_removed(keep, r, rule_name, reason_text))
             continue
         seen[k] = r
         kept.append(r)
     rows = kept
     ok = lambda r: r["requires_auth"] == "N" and bool(r["content_hash_sha256"])
     # 2) same bytes at several URLs, 3) same normalised text, 4) same canonical URL
-    rows = _collapse(rows, lambda r: (r["payer_name"], r["content_hash_sha256"]) if ok(r) else None, "identical_sha256", removed)
-    rows = _collapse(rows, lambda r: (r["payer_name"], r["_fp"]) if ok(r) and r["_fp"] else None, "identical_text", removed)
-    rows = _collapse(rows, lambda r: (r["payer_name"], r["_canon"]) if r["_canon"] else None, "same_canonical_url", removed)
+    rows = _collapse(rows, lambda r: (r["payer_name"], r["content_hash_sha256"]) if ok(r) else None, "identical_sha256", "Identical file content (exact SHA-256 hash match). Kept the version with better ownership/status.", removed)
+    rows = _collapse(rows, lambda r: (r["payer_name"], r["_fp"]) if ok(r) and r["_fp"] else None, "identical_text", "Identical extracted text content (near-duplicate). Kept the primary version.", removed)
+    rows = _collapse(rows, lambda r: (r["payer_name"], r["_canon"]) if r["_canon"] else None, "same_canonical_url", "Both URLs share the same HTML <link rel='canonical'> tag. Kept the canonical version.", removed)
+    
     # 5) dated revisions
     rows = _revisions(rows, removed)
     for r in rows:
@@ -1176,8 +1199,27 @@ def export(db: StateDB) -> None:
     _write_csv(summaries, list(summaries[0].keys()) if summaries else [], os.path.join(OUTPUT_DIR, "run_summary.csv"))
     _write_csv(removed, REMOVED_COLUMNS, os.path.join(OUTPUT_DIR, "near_duplicates_removed.csv"))
     
-    rej = [{"payer_name": r["payer"], "document_url": r["document_url"], **json.loads(r["decision"] or "{}")}
-           for r in db.con.execute("SELECT payer, document_url, decision FROM documents WHERE accepted=0")]
+    rej = []
+    for r in db.con.execute("SELECT payer, document_url, row_json, decision FROM documents WHERE accepted=0"):
+        row = json.loads(r["row_json"] or "{}")
+        dec = json.loads(r["decision"] or "{}")
+        
+        llm_data = dec.get("llm") or {}
+        if not isinstance(llm_data, dict):
+            llm_data = {}
+            
+        rej.append({
+            "payer_name": r["payer"],
+            "document_url": r["document_url"],
+            "document_title": row.get("document_title", ""),
+            "file_type": row.get("file_type", ""),
+            "link_score": dec.get("link_score", ""),
+            "content_score": dec.get("content_score", ""),
+            "rejection_reason": dec.get("reason", "Unknown"),
+            "llm_reason": llm_data.get("reason", ""),
+            "content_signals": ", ".join(dec.get("content_signals", [])),
+            "link_signals": ", ".join(dec.get("link_signals", []))
+        })
     if rej:
         _write_csv(rej, list(rej[0].keys()), os.path.join(OUTPUT_DIR, "rejected_candidates.csv"))
         

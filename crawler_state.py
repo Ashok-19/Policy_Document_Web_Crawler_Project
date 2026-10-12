@@ -360,7 +360,7 @@ class StateDB:
             decision TEXT, route TEXT, created_at TEXT, PRIMARY KEY(payer, key));
         CREATE TABLE IF NOT EXISTS skipped_links(
             payer TEXT, key TEXT, url TEXT, source_page_url TEXT, anchor TEXT, score REAL, hub_score REAL,
-            reason TEXT, at TEXT, PRIMARY KEY(payer, key));
+            reason TEXT, at TEXT, heading TEXT, page_context TEXT, PRIMARY KEY(payer, key));
         CREATE TABLE IF NOT EXISTS phases(payer TEXT, phase TEXT, done_at TEXT, PRIMARY KEY(payer, phase));
         CREATE TABLE IF NOT EXISTS kv(payer TEXT, k TEXT, v TEXT, PRIMARY KEY(payer, k));
         CREATE TABLE IF NOT EXISTS blocked_pages(payer TEXT, url TEXT, reason TEXT, status INT, at TEXT, PRIMARY KEY(payer, url));
@@ -430,10 +430,10 @@ class StateDB:
             return True
         return False
 
-    def skip_link(self, payer: str, url: str, source: str, anchor: str, score: float, hub: float, reason: str) -> None:
-        self.con.execute("INSERT OR IGNORE INTO skipped_links VALUES(?,?,?,?,?,?,?,?,?)",
-                         (payer, url_key(url), url, source, clean_text(anchor, 200), score, hub, reason, utc_now_iso()))
-
+    def skip_link(self, payer: str, url: str, source: str, anchor: str, score: float, hub: float, reason: str, heading: str = "", page_context: str = "") -> None:
+        self.con.execute("INSERT OR IGNORE INTO skipped_links VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (payer, url_key(url), url, source, clean_text(anchor, 200), score, hub, reason, utc_now_iso(), clean_text(heading, 200), clean_text(page_context, 300)))
+        
     def commit(self) -> None:
         self.con.commit()
 
