@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover
         fitz = None
 
 from crawler_config import (BLOCK_TRACKER_REQUESTS_IN_BROWSER, FETCH_WORKERS, TRACKER_HOST_SUFFIXES, CONTACT, IDP_HOST_SUFFIXES, MAX_CRAWL_DELAY_SECONDS, MAX_EXPAND_CLICKS, MAX_PAGINATION_STEPS, MAX_PARSE_BYTES, MAX_RETRIES, MAX_SELECT_OPTIONS, MAX_SNAPSHOTS, MAX_STREAM_BYTES, MAX_TAB_CLICKS, PLAYWRIGHT_NAV_TIMEOUT_MS, REQUEST_DELAY_SECONDS, REQUEST_TIMEOUT_SECONDS, RETRY_STATUSES, TEXT_FP_MAX_PAGES, USER_AGENT, USE_OCR, USE_PLAYWRIGHT, log, utc_now_iso)
-from crawler_text import (DOC_EXTS, clean_text, clean_text_keep_lines, host_has_suffix, http_date_to_iso, is_good_title, link_kind, normalize_url, sha256_hex, trim_title, url_ext, url_key)
+from crawler_text import (DOC_EXTS, MAYBE_DOC_HINTS, clean_text, clean_text_keep_lines, host_has_suffix, is_cdn_host, http_date_to_iso, is_good_title, link_kind, normalize_url, sha256_hex, trim_title, url_ext, url_key)
 
 
 # =============================================================================
@@ -480,6 +480,9 @@ def _visible_text_len(body: bytes) -> int:
 def classify_block(status: int, original_url: str, final_url: str, body: bytes) -> str:
     head = body[:60000]
     is_pdf = body[:5].startswith(b"%PDF")
+    host = urlparse(original_url).hostname or ""
+    is_cdn = is_cdn_host(host)
+    
     if status == 401:
         return "auth_401"
     if status == 407:
@@ -488,29 +491,35 @@ def classify_block(status: int, original_url: str, final_url: str, body: bytes) 
         for vendor, rx in WAF_SIGNATURES:
             if rx.search(head):
                 return f"bot_challenge_{vendor}_{status}"
-    if status == 403:
-        if _PASSWORD_RX.search(head) or _REG_WALL_RX.search(head):
-            return "auth_403_login"
-        return "forbidden_403"
-    if status == 429:
-        return "rate_limited_429"
+        if status == 403:
+            if not is_cdn and (_PASSWORD_RX.search(head) or _REG_WALL_RX.search(head)):
+                return "auth_403_login"
+            return "forbidden_403"
+        if status == 429:
+            return "rate_limited_429"
     if 200 <= status < 400 and not is_pdf:
         if final_url and url_key(final_url) != url_key(original_url):
             fp = urlparse(final_url)
             if host_has_suffix(fp.hostname or "", IDP_HOST_SUFFIXES) or (
-                    LOGIN_URL_RX.search(f"{fp.path}?{fp.query}") and not LOGIN_URL_RX.search(urlparse(original_url).path)):
+                LOGIN_URL_RX.search(f"{fp.path}?{fp.query}") and not LOGIN_URL_RX.search(urlparse(original_url).path)):
                 return "login_redirect"
         if status == 200 and len(body) < 40000:
             for vendor, rx in WAF_SIGNATURES_200:
                 if rx.search(head):
-                    return f"bot_challenge_{vendor}_{status}"
+                    # Allow CDN bot challenges to pass through to browser retry or normal parsing
+                    if not is_cdn:
+                        return f"bot_challenge_{vendor}_{status}"
         if b"<" in head[:2000]:
             n_links = len(re.findall(rb"<a\s", head, re.I))
             vis = _visible_text_len(head)
-            if _PASSWORD_RX.search(head) and vis < 1500 and n_links < 25:
-                return "login_wall"
-            if _REG_WALL_RX.search(head) and vis < 1200 and n_links < 25:
-                return "registration_wall"
+            # CRITICAL FIX: Do not classify CDN responses as login/registration walls.
+            # CDNs frequently have generic "Sign In" footer links that trigger false positives 
+            # when the visible text is small (e.g., an empty PDF wrapper or minimal HTML).
+            if not is_cdn:
+                if _PASSWORD_RX.search(head) and vis < 1500 and n_links < 25:
+                    return "login_wall"
+                if _REG_WALL_RX.search(head) and vis < 1200 and n_links < 25:
+                    return "registration_wall"
     return ""
 
 
@@ -595,8 +604,37 @@ class Fetcher:
         return rp
 
     def allowed(self, url: str) -> bool:
+        host = urlparse(url).hostname or ""
+        
+        # 1. Bypass robots.txt check for known CDN hosts.
+        if is_cdn_host(host):
+            return True
+            
+        low_url = url.lower()
+        
+        # 2. DYNAMIC BYPASS: 3-Layer Safety Net for Documents
+        
+        # Layer A: Extension is at the very end (e.g., /file.pdf)
+        ext = url_ext(url)
+        if ext in DOC_EXTS:
+            return True
+            
+        # Layer B: Extension appears ANYWHERE in the URL 
+        # (e.g., /pdf/document-name or /api/file.docx/download)
+        # This guarantees we catch mid-URL extensions that url_ext() might miss.
+        if re.search(r"\.(pdf|docx?|xlsx?|csv|rtf|txt)\b", low_url):
+            return True
+            
+        # Layer C: Common document repository keywords anywhere in the URL
+        # (e.g., /content/dam/, /documents/, getdocument, etc.)
+        if any(hint in low_url for hint in MAYBE_DOC_HINTS):
+            return True
+
+        # 3. For regular HTML pages, strictly respect robots.txt
         rp = self.robots_for(url)
         return True if rp is None else rp.can_fetch(url, USER_AGENT)
+
+
 
     def sitemaps_from_robots(self, url: str) -> list[str]:
         rp = self.robots_for(url)

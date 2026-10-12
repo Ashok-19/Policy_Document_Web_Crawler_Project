@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover
 from crawler_config import (PARALLEL_PAYERS, STOP, PREFETCH_AHEAD, BROWSER_RETRY_ON_BOT_CHALLENGE, COLUMNS, DOC_CANDIDATE_MIN_SCORE, DOC_DONE_STATES, ENUMS, EXTERNAL_DOC_MIN_SCORE, EXTRA_START_URLS, HOMEPAGE_URL, HUB_INHERIT_MAX_BONUS, HUB_INHERIT_MIN_SCORE, KNOWN_PATTERN_MIN_DOCS, LLM_FOR_MISSING_FIELDS, MAX_DEPTH, MAX_DOCUMENTS_PER_PAYER, MAX_PAGES_PER_PAYER, MAX_PARSE_BYTES, MAX_RENDERS_PER_PAYER, MAX_SITEMAP_FILES, MAX_SITEMAP_URLS, MAYBE_DOC_MIN_SCORE, NAV_FOLLOW_MIN_SCORE, NOTES_MAX_CHARS, OLLAMA_MODEL, OUTPUT_DIR, PAGE_DONE_STATES, PAGE_FOLLOW_MIN_SCORE, PAYER_NAME, PAYER_REGISTRY, ProgressUI, RELATED_DOMAIN_DEPTH_BUDGET, RELATED_DOMAIN_MIN_SCORE, RESET_PAYER_STATE, REVISION_POLICY, RUN_ALL_PAYERS, SAVE_DOCUMENT_FILES, SEED_LIST_CSV, STATE_DB, STATE_JOINER, STATE_NATIONAL, UNFETCHED_DOC_ROW_MIN_SCORE, log, setup_logging, utc_now_iso)
 from crawler_io import (Browser, FetchResult, Fetcher, Inspection, Link, RenderResult, VIA_BY_ORIGIN, extract_links, inspect_content, inspect_html, is_auth_block, links_from_json, needs_js, sniff_file_type)
 from crawler_state import (LLMClassifier, PolicyRow, StateDB, load_schema_dictionary)
-from crawler_text import (THIRD_PARTY_BLOCKLIST, classify_doc_type, clean_anchor, clean_text, content_fingerprint, detect_lob, detect_state, extract_dates, extract_policy_number, html_policy_evidence, is_cdn_host, is_good_title, join_notes, link_kind, normalize_url, parse_date, reg_domain, register_brands, score_link, sha256_hex, short_url, text_fingerprint, title_from_filename, trim_title, url_ext, url_key, url_words)
+from crawler_text import (DOC_EXTS, THIRD_PARTY_BLOCKLIST, classify_doc_type, clean_anchor, clean_text, content_fingerprint, detect_lob, detect_state, extract_dates, extract_policy_number, html_policy_evidence, is_cdn_host, is_good_title, join_notes, link_kind, normalize_url, parse_date, reg_domain, register_brands, score_link, sha256_hex, short_url, text_fingerprint, title_from_filename, trim_title, url_ext, url_key, url_words)
 
 
 # =============================================================================
@@ -459,6 +459,16 @@ class PayerCrawler:
                 if page_is_hub and sc >= 0:      # documents listed on a policy hub inherit part of its evidence
                     sc = round(sc + min(HUB_INHERIT_MAX_BONUS, 0.25 * hub_score), 2)
                     sig = sig + ["hub_inherit"]
+
+                # === Baseline score for CDN documents ===
+                # CDNs often have generic anchors (e.g., "Download") and opaque URLs. 
+                # If it's a valid document extension and linked from an in-scope page, 
+                # guarantee it meets the minimum threshold to be fetched and inspected.
+                if is_cdn_host(host) and url_ext(l.url) in DOC_EXTS:
+                    sc = max(sc, DOC_CANDIDATE_MIN_SCORE)
+                    sig.append("cdn_doc_baseline")
+                # ==================================================
+
                 threshold = DOC_CANDIDATE_MIN_SCORE if kind == "doc" else MAYBE_DOC_MIN_SCORE
                 external = not in_scope and not is_cdn_host(host)
                 if external:

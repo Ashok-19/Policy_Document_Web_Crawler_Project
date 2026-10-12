@@ -108,7 +108,7 @@ MAX_PAGES_PER_PAYER = 2500        # HTML pages crawled
 MAX_DOCUMENTS_PER_PAYER = 20000   # document candidates fetched
 MAX_DEPTH = 5                     # link hops from the seed
 RELATED_DOMAIN_DEPTH_BUDGET = 3   # hops allowed inside a newly discovered (non-affiliated) related domain
-MAX_SITEMAP_URLS = 300000
+MAX_SITEMAP_URLS = 100000
 MAX_SITEMAP_FILES = 400
 KNOWN_PATTERN_MIN_DOCS = 50       # run the known-URL-pattern fallback if fewer docs than this
 
@@ -118,11 +118,11 @@ MAYBE_DOC_MIN_SCORE = 5.0         # extension-less "maybe document" links need m
 EXTERNAL_DOC_MIN_SCORE = 5.0      # documents on hosts the payer does not own need more evidence
 PAGE_FOLLOW_MIN_SCORE = 2.0       # HTML pages at/above this are crawled
 NAV_FOLLOW_MIN_SCORE = 0.5        # depth-1 navigation links from the homepage
-RELATED_DOMAIN_MIN_SCORE = 6.0    # off-domain page must score this to open a related domain
+RELATED_DOMAIN_MIN_SCORE = 8.5    # off-domain page must score this to open a related domain
 HUB_INHERIT_MIN_SCORE = 5.0       # documents on a policy hub page inherit part of the hub's score
 HUB_INHERIT_MAX_BONUS = 2.0
 UNFETCHED_DOC_ROW_MIN_SCORE = 6.0 # strong candidate that could not be fetched still gets a (non-200) row
-REOPEN_REJECTED_SCORE_GAIN = 1.0  # a rejected document is re-evaluated if it re-appears with this much more evidence
+REOPEN_REJECTED_SCORE_GAIN = 99.0  # a rejected document is re-evaluated if it re-appears with this much more evidence
 
 INFER_STATE_FROM_PAYER_FOOTPRINT = True   # single-state payers: use footprint_state (noted, -0.05 confidence)
 REVISION_POLICY = "flag"          # "flag": keep every dated revision, flag latest/superseded in notes
@@ -132,7 +132,7 @@ TEXT_FP_MIN_CHARS = 500           # shorter texts get no text fingerprint (too l
 
 # Hosts that serve files for many sites. A document here is accepted only when it is linked from an in-scope page.
 CDN_HOST_SUFFIXES = ("azureedge.net", "azurefd.net", "cloudfront.net", "blob.core.windows.net", "akamaized.net",
-                     "amazonaws.com", "ctfassets.net", "widen.net", "sitecorecontenthub.cloud", "bynder.com",
+                     "amazonaws.com", "ctfassets.net", "widen.net", "widencdn.net", "sitecorecontenthub.cloud", "bynder.com",
                      "brightspotcdn.com", "cdn.prismic.io", "googleusercontent.com")
 IDP_HOST_SUFFIXES = ("okta.com", "oktapreview.com", "auth0.com", "b2clogin.com", "login.microsoftonline.com",
                      "onelogin.com", "pingone.com", "pingidentity.com", "forgerock.io")
