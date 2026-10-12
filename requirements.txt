@@ -1,0 +1,22 @@
+# Python 3.10+
+# After installing:  python -m playwright install chromium
+httpx>=0.27
+selectolax>=0.3.21
+protego>=0.3
+tldextract>=5.1
+python-dateutil>=2.9
+pydantic>=2.6
+pandas>=2.1
+openpyxl>=3.1
+PyMuPDF>=1.24
+lxml>=5.1
+playwright>=1.44
+rich>=13.7            # live progress bar in the terminal
+
+# Optional
+pytesseract>=0.3.10   # OCR for scanned PDFs (also needs the Tesseract binary: apt install tesseract-ocr / brew install tesseract)
+Pillow>=10.0
+brotli>=1.1           # only used if a server ignores "Accept-Encoding: identity" and sends br-compressed bodies
+
+# LLM fallback runs on Ollama (separate install, not pip):
+#   https://ollama.com/download   then:   ollama pull qwen2.5:3b
