@@ -24,10 +24,10 @@ try:
 except ImportError:  # pragma: no cover
     etree = None
 
-from crawler_config import (PARALLEL_PAYERS, STOP, PREFETCH_AHEAD, BROWSER_RETRY_ON_BOT_CHALLENGE, COLUMNS, DOC_CANDIDATE_MIN_SCORE, DOC_DONE_STATES, ENUMS, EXTERNAL_DOC_MIN_SCORE, EXTRA_START_URLS, HOMEPAGE_URL, HUB_INHERIT_MAX_BONUS, HUB_INHERIT_MIN_SCORE, KNOWN_PATTERN_MIN_DOCS, LLM_FOR_MISSING_FIELDS, MAX_DEPTH, MAX_DOCUMENTS_PER_PAYER, MAX_PAGES_PER_PAYER, MAX_PARSE_BYTES, MAX_RENDERS_PER_PAYER, MAX_SITEMAP_FILES, MAX_SITEMAP_URLS, MAYBE_DOC_MIN_SCORE, NAV_FOLLOW_MIN_SCORE, NOTES_MAX_CHARS, OLLAMA_MODEL, OUTPUT_DIR, PAGE_DONE_STATES, PAGE_FOLLOW_MIN_SCORE, PAYER_NAME, PAYER_REGISTRY, ProgressUI, RELATED_DOMAIN_DEPTH_BUDGET, RELATED_DOMAIN_MIN_SCORE, RESET_PAYER_STATE, REVISION_POLICY, RUN_ALL_PAYERS, SAVE_DOCUMENT_FILES, SEED_LIST_CSV, STATE_DB, STATE_JOINER, STATE_NATIONAL, UNFETCHED_DOC_ROW_MIN_SCORE, log, setup_logging, utc_now_iso)
+from crawler_config import (EXCLUDED_DOC_TYPES, PARALLEL_PAYERS, STOP, PREFETCH_AHEAD, BROWSER_RETRY_ON_BOT_CHALLENGE, COLUMNS, DOC_CANDIDATE_MIN_SCORE, DOC_DONE_STATES, ENUMS, EXTERNAL_DOC_MIN_SCORE, EXTRA_START_URLS, HOMEPAGE_URL, HUB_INHERIT_MAX_BONUS, HUB_INHERIT_MIN_SCORE, KNOWN_PATTERN_MIN_DOCS, LLM_FOR_MISSING_FIELDS, MAX_DEPTH, MAX_DOCUMENTS_PER_PAYER, MAX_PAGES_PER_PAYER, MAX_PARSE_BYTES, MAX_RENDERS_PER_PAYER, MAX_SITEMAP_FILES, MAX_SITEMAP_URLS, MAYBE_DOC_MIN_SCORE, NAV_FOLLOW_MIN_SCORE, NOTES_MAX_CHARS, OLLAMA_MODEL, OUTPUT_DIR, PAGE_DONE_STATES, PAGE_FOLLOW_MIN_SCORE, PAYER_NAME, PAYER_REGISTRY, ProgressUI, RELATED_DOMAIN_DEPTH_BUDGET, RELATED_DOMAIN_MIN_SCORE, RESET_PAYER_STATE, REVISION_POLICY, RUN_ALL_PAYERS, SAVE_DOCUMENT_FILES, SEED_LIST_CSV, STATE_DB, STATE_JOINER, STATE_NATIONAL, UNFETCHED_DOC_ROW_MIN_SCORE, log, setup_logging, utc_now_iso)
 from crawler_io import (Browser, FetchResult, Fetcher, Inspection, Link, RenderResult, VIA_BY_ORIGIN, extract_links, inspect_content, inspect_html, is_auth_block, links_from_json, needs_js, sniff_file_type)
 from crawler_state import (LLMClassifier, PolicyRow, StateDB, load_schema_dictionary)
-from crawler_text import (DOC_EXTS, THIRD_PARTY_BLOCKLIST, classify_doc_type, clean_anchor, clean_text, content_fingerprint, detect_lob, detect_state, extract_dates, extract_policy_number, html_policy_evidence, is_cdn_host, is_good_title, join_notes, link_kind, normalize_url, parse_date, reg_domain, register_brands, score_link, sha256_hex, short_url, text_fingerprint, title_from_filename, trim_title, url_ext, url_key, url_words)
+from crawler_text import (DOC_EXTS, excluded_doc_type, THIRD_PARTY_BLOCKLIST, classify_doc_type, clean_anchor, clean_text, content_fingerprint, detect_lob, detect_state, extract_dates, extract_policy_number, html_policy_evidence, is_cdn_host, is_good_title, join_notes, link_kind, normalize_url, parse_date, reg_domain, register_brands, score_link, sha256_hex, short_url, text_fingerprint, title_from_filename, trim_title, url_ext, url_key, url_words)
 
 
 # =============================================================================
@@ -73,7 +73,7 @@ class PayerCrawler:
     def __init__(self, payer: dict, db: StateDB, fetcher: Fetcher, browser: Browser, llm: LLMClassifier, ui: ProgressUI) -> None:
         self.p = payer
         self.name = payer["payer_name"]
-        self.alias = payer.get("payer_alias", "")
+        self.alias = payer.get("payer_alias") or payer["payer_name"]
         self.footprint = payer.get("footprint_state", "") or ""
         self.db, self.fx, self.br, self.llm, self.ui = db, fetcher, browser, llm, ui
         self.affiliated = {reg_domain(d) for d in payer.get("affiliated_domains", []) if d}
@@ -456,6 +456,12 @@ class PayerCrawler:
             hints["_via"] = via
             in_scope = dom in self.home_domains or dom in self.related_domains
             if kind in ("doc", "maybe_doc"):
+                excl = excluded_doc_type(f"{clean_anchor(l.anchor)} {url_words(l.url)}")
+                if excl:       # provider manuals / bulletins are not collected: report, do not fetch
+                    self.db.skip_link(self.name, l.url, page_url, l.anchor, sc, hub_score,
+                                      f"Excluded document type: {excl} (link text/URL). "
+                                      f"Anchor text: '{clean_anchor(l.anchor)[:100]}'.", l.heading, page_ctx)
+                    continue
                 if page_is_hub and sc >= 0:      # documents listed on a policy hub inherit part of its evidence
                     sc = round(sc + min(HUB_INHERIT_MAX_BONUS, 0.25 * hub_score), 2)
                     sig = sig + ["hub_inherit"]
@@ -604,6 +610,7 @@ class PayerCrawler:
         # document_url: the final URL after redirects, unless the redirect went to a login page / error host
         document_url = url if (auth or not r.final_url) else r.final_url
         notes = [sentence, "metadata from link text only; content not verified",
+                 "policy_number, effective_date and last_updated_date not available: document not retrieved",
                  f"file type unknown (not retrieved; URL suffix .{url_ext(url)})" if url_ext(url) else "file type unknown (not retrieved)"]
         if reimb:
             notes.append("reimbursement/payment policy - typed other")
@@ -707,12 +714,13 @@ class PayerCrawler:
             penalty += 0.05
             notes.append("title derived from the file name (no usable heading or link text)")
         own = " ".join([title, anchor, url_words(document_url)])
-        pnum, psrc = extract_policy_number(text, title)
+        pnum, psrc = extract_policy_number(text, title, ins.tail_text, document_url)
         if not pnum and hints.get("policy_number"):
             pnum, psrc = clean_text(str(hints["policy_number"]), 30), "json"
         dtype, _dsrc, reimb = classify_doc_type(own, header, body, around, pnum)
-        lob, lsrc = detect_lob(own, header, around)
-        state, ssrc = detect_state(document_url, own, header, around, self.footprint)
+        ctx = " ".join(x for x in [around, url_words(item.get("source_page_url") or "")] if x)   # listing page heading + its URL words
+        lob, lsrc = detect_lob(own, header, ctx, text.lstrip())
+        state, ssrc = detect_state(document_url, own, header, ctx, self.footprint)
         if LLM_FOR_MISSING_FIELDS and ins.readable and not llm_res and (lob == "Unknown" or (dtype == "other" and not reimb)):
             llm_res = self.llm.classify(self.name, document_url, anchor, around, title, text)
             decision["llm"] = llm_res
@@ -725,19 +733,28 @@ class PayerCrawler:
                 lob, lsrc, llm_used = llm_res["line_of_business"], "llm", True
                 notes.append(f"line_of_business from LLM ({OLLAMA_MODEL})")
                 penalty += 0.03
+        if dtype in EXCLUDED_DOC_TYPES:
+            reason = f"Excluded document type: {dtype} (content). Title: '{title[:100]}'."
+            self.db.skip_link(self.name, document_url, item.get("source_page_url", ""), anchor, ls,
+                              float(item.get("link_score") or 0), reason, item.get("heading") or "", item.get("page_ctx") or "")
+            return reject(reason)
         if reimb:
             notes.append("reimbursement/payment policy - no matching document_type, typed other")
         elif dtype == "other":
             notes.append("document type unclear - typed other")
             penalty += 0.05
         if lsrc == "listing page":
-            notes.append("line_of_business taken from the listing page heading")
+            notes.append("line_of_business taken from the listing page heading/URL")
+        elif lsrc == "document body":
+            notes.append("line_of_business taken from the opening of the document")
+        if psrc == "url":
+            notes.append("policy_number taken from the file name (not printed in the document)")
         if ssrc == "payer footprint":
             notes.append(f"state inferred from payer's single-state footprint ({self.footprint})")
             penalty += 0.05
         elif ssrc == "listing page":
             notes.append("state taken from the listing page heading")
-        dates = extract_dates(text)
+        dates = extract_dates(text, ins.tail_text)
         notes += dates["notes"]
         eff, upd = dates["effective_date"], dates["last_updated_date"]
         if not eff and hints.get("effective_date"):
@@ -751,6 +768,9 @@ class PayerCrawler:
             if d:
                 upd = d
                 notes.append("last_updated_date from the site's document index (JSON)")
+        if not upd and ins.meta_modified:
+            upd = ins.meta_modified
+            notes.append("last_updated_date from the file's own metadata (none printed)")
         if upd and r.last_modified and r.last_modified != upd:
             notes.append(f"printed revision date {upd}; HTTP Last-Modified {r.last_modified}")
         elif not upd and r.last_modified:
@@ -760,6 +780,12 @@ class PayerCrawler:
             notes.append(f"only the first {MAX_PARSE_BYTES // (1024 * 1024)} MB were parsed; hash/size cover the full file")
         if document_url != url:
             notes.append(f"redirected from {url}")
+        missing = [n for n, v in (("policy_number", pnum), ("effective_date", eff), ("last_updated_date", upd),
+                                  ("line_of_business", "" if lob == "Unknown" else lob)) if not v]
+        if ssrc == "default":
+            missing.append("state (defaulted to National)")
+        if missing:        # first, so the note survives truncation
+            notes.insert(0, MISSING_PREFIX + ", ".join(missing))
         if ins.ocr:
             penalty += 0.05
         if llm_used and not any("LLM" in n for n in notes):
@@ -861,6 +887,24 @@ REMOVED_COLUMNS = [
     "removed_document_url", "removed_title", "removed_confidence", "content_hash_sha256"
 ]
 
+MISSING_PREFIX = "Not found in document: "
+_MISSING_RX = re.compile(re.escape(MISSING_PREFIX) + r"[^;.]*(?:\([^)]*\))?[^;.]*[;.]?\s*")
+
+
+def _refresh_missing_note(row: dict) -> None:
+    """Fields filled in by the duplicate merge are no longer 'not found': rewrite (or drop) the leading flag."""
+    if MISSING_PREFIX not in row["notes"]:
+        return
+    still = [n for n in ("policy_number", "effective_date", "last_updated_date") if not row[n]]
+    if row["line_of_business"] == "Unknown":
+        still.append("line_of_business")
+    if "state (defaulted to National)" in row["notes"]:
+        still.append("state (defaulted to National)")
+    new = MISSING_PREFIX + ", ".join(still) + "; " if still else ""
+    notes = _MISSING_RX.sub(new, row["notes"], count=1).strip().rstrip(";").strip()
+    row["notes"] = notes if not notes or notes.endswith(".") else notes + "."
+
+
 def _removed(keep: dict, r: dict, rule: str, reason: str = "") -> dict:
     return {
         "payer_name": r["payer_name"],
@@ -870,6 +914,7 @@ def _removed(keep: dict, r: dict, rule: str, reason: str = "") -> dict:
         "kept_title": keep.get("document_title", ""),
         "kept_confidence": keep.get("confidence_score", ""),
         "removed_document_url": r["document_url"],
+        "removed_source_page_url": r.get("source_page_url", ""),
         "removed_title": r.get("document_title", ""),
         "removed_confidence": r.get("confidence_score", ""),
         "content_hash_sha256": r.get("content_hash_sha256", "")
@@ -1040,6 +1085,7 @@ def build_rows(db: StateDB) -> tuple[list[dict], list[dict]]:
     # 5) dated revisions
     rows = _revisions(rows, removed)
     for r in rows:
+        _refresh_missing_note(r)
         for k in ("_fp", "_canon", "_owner"):
             r.pop(k, None)
         r["notes"] = join_notes([r["notes"].rstrip(".")], limit=NOTES_MAX_CHARS + 300)
@@ -1203,6 +1249,8 @@ def export(db: StateDB) -> None:
     for r in db.con.execute("SELECT payer, document_url, row_json, decision FROM documents WHERE accepted=0"):
         row = json.loads(r["row_json"] or "{}")
         dec = json.loads(r["decision"] or "{}")
+        if str(dec.get("reason", "")).startswith("Excluded document type"):
+            continue       # listed in skipped_doc_links.csv
         
         llm_data = dec.get("llm") or {}
         if not isinstance(llm_data, dict):
@@ -1228,10 +1276,20 @@ def export(db: StateDB) -> None:
         _write_csv(blocked, list(blocked[0].keys()), os.path.join(OUTPUT_DIR, "blocked_pages.csv"))
         
     sk = [dict(r) for r in db.con.execute(
-        "SELECT s.* FROM skipped_links s LEFT JOIN frontier f ON f.payer=s.payer AND f.key=s.key WHERE f.key IS NULL "
+        "SELECT s.* FROM skipped_links s LEFT JOIN frontier f ON f.payer=s.payer AND f.key=s.key "
+        "WHERE f.key IS NULL OR s.reason LIKE 'Excluded document type%' "
         "ORDER BY s.payer, s.source_page_url, s.score DESC")]
+    # duplicates and superseded revisions dropped at export are reported here too, with the document that was kept
+    now = utc_now_iso()
+    for x in removed:
+        sk.append({"payer": x["payer_name"], "key": url_key(x["removed_document_url"]), "url": x["removed_document_url"],
+                   "source_page_url": x.get("removed_source_page_url", ""), "anchor": x.get("removed_title", ""),
+                   "score": x.get("removed_confidence", ""), "hub_score": "",
+                   "reason": f"{x['rule']}: {x['reason']} Kept: {x['kept_document_url']}", "at": now,
+                   "heading": "", "page_context": ""})
     if sk:
-        _write_csv(sk, list(sk[0].keys()), os.path.join(OUTPUT_DIR, "skipped_doc_links.csv"))
+        _write_csv(sk, ["payer", "key", "url", "source_page_url", "anchor", "score", "hub_score", "reason", "at",
+                        "heading", "page_context"], os.path.join(OUTPUT_DIR, "skipped_doc_links.csv"))
         
     for s in summaries:
         log(logging.INFO, "run_summary", **{k: s[k] for k in ("payer_name", "attempted", "found", "failed", "skipped",

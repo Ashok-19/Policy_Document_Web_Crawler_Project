@@ -17,7 +17,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
-from crawler_config import (CDN_HOST_SUFFIXES, INFER_STATE_FROM_PAYER_FOOTPRINT, NOTES_MAX_CHARS, PAYER_REGISTRY, STATE_JOINER, STATE_NATIONAL, TEXT_FP_MIN_CHARS)
+from crawler_config import (CDN_HOST_SUFFIXES, EXCLUDED_DOC_TYPES, INFER_STATE_FROM_PAYER_FOOTPRINT, NOTES_MAX_CHARS, PAYER_REGISTRY, STATE_JOINER, STATE_NATIONAL, TEXT_FP_MIN_CHARS)
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -196,8 +196,21 @@ POSITIVE_TERMS: list[tuple[str, float]] = [
     (r"step therapy|quantity limits?", 4),
     (r"(?:reimbursement|payment) polic(?:y|ies)", 5),
     (r"polic(?:y|ies),? (?:and|&) (?:guidelines|procedures|protocols|criteria)", 5),
-    (r"provider (?:manual|handbook|administrative (?:guide|manual)|reference guide)|administrative guide", 4),
-    (r"polic(?:y|ies) (?:updates?|bulletins?|notifications?)", 3), (r"\bbulletins?\b", 2),
+    # --- added: policy hubs / numbering schemes / criteria / pharmacy edits / PA forms
+    (r"polic(?:y|ies) (?:search|finder|library|index|lookup|center|manual)|search (?:medical |coverage |clinical )?polic(?:y|ies)", 4),
+    (r"archived (?:medical |coverage |clinical )?polic(?:y|ies)|retired polic(?:y|ies)", 3),
+    (r"medical necessity|experimental (?:or|/|and) investigational|investigational", 3),
+    (r"(?:prior authorization|pa|drug coverage|coverage approval|approval) criteria|criteria for (?:coverage|approval|use)", 5),
+    (r"(?:clinical|coverage|medical|drug) (?:review )?criteria", 4),
+    (r"\b(?:cg|ocg)[\s-][a-z]{2,6}[\s-]\d+\b|\b(?:med|surg|drug|rad|lab|gene|dme|rx|beh|ther|trans|ocg)[\s.]\d{5}\b|\bcpb\b", 4),
+    (r"site[\s-]of[\s-]care (?:polic(?:y|ies)|guidelines?|criteria)", 5),
+    (r"level[\s-]of[\s-]care (?:guidelines?|criteria)|behavioral health (?:clinical|coverage|medical necessity) (?:polic(?:y|ies)|guidelines?|criteria)", 5),
+    (r"(?:medical )?injectables?|specialty (?:drugs?|medications?)|biosimilars?|clinical edits?|drug exclusions?|excluded drugs?|exclusion lists?", 4),
+    (r"(?:prior authorization|precertification|pre-?authorization) (?:code )?(?:list|lookup|requirements?|criteria|matrix)", 5),
+    (r"(?:services|codes|procedures|drugs|medications) (?:that )?(?:require|requiring) (?:prior auth\w*|precert\w*|pre-?authorization)", 5),
+    (r"(?:formulary|step therapy|quantity limit|prior authorization|coverage|tier) (?:exceptions?|overrides?)", 4),
+    (r"(?:medication|drug|pharmacy|rx) (?:prior authorization|pa|exception|coverage determination) (?:request|forms?)", 5),
+    (r"(?:formulary|drug list|preferred drug list|pdl) (?:updates?|changes|additions|deletions|exclusions?)", 3),
     (r"(?:authorization|request|exception|precertification|pa|referral) forms?", 4),
     (r"medication request|drug request|coverage determination", 3),
     (r"\bpolicies\b", 2), (r"\bpolicy\b", 1), (r"\bcriteria\b", 2), (r"\bguidelines?\b", 1),
@@ -206,7 +219,11 @@ NAV_TERMS: list[tuple[str, float]] = [
     (r"for providers|provider resources|provider center|provider portal resources", 3),
     (r"\bproviders?\b|professionals?|practitioners?|clinicians?", 2), (r"\bpharmacy\b|\bpharmacists?\b", 2.5),
     (r"\bresources?\b|\btools\b|\blibrary\b", 1), (r"\bforms?\b", 1.5), (r"\bdrugs?\b|prescriptions?", 1.5),
-    (r"\bclinical\b", 1.5), (r"\bmanuals?\b", 1), (r"\bplans?\b", 0.3),
+    (r"\bclinical\b", 1.5), (r"\bplans?\b", 0.3),
+    (r"polic(?:y|ies) (?:and|&) (?:guidelines|procedures|criteria|coverage)|coverage (?:and|&) (?:polic(?:y|ies)|criteria|guidelines)", 3),
+    (r"utilization management|medical management|prior auth|precert|authorizations?", 2),
+    (r"pharmacy (?:benefits?|resources|services|programs?)|clinical (?:resources|tools|programs)|medical (?:resources|policies)", 2),
+    (r"forms (?:and|&) (?:documents|resources|guides)|documents (?:and|&) forms|document library", 2),
 ]
 NEGATIVE_TERMS: list[tuple[str, float]] = [
     (r"privacy|hipaa notice|notice of privacy practices", -10), (r"terms (?:of use|and conditions|of service)", -10),
@@ -221,6 +238,22 @@ NEGATIVE_TERMS: list[tuple[str, float]] = [
     (r"transparency in coverage|machine[\s-]readable|\bmrf\b|price transparency", -6),
     (r"facebook|twitter|linkedin|instagram|youtube", -10), (r"\bsitemap\b", -2), (r"\bespa[nñ]ol\b|\bspanish\b", -0.5),
     (r"shop (?:for )?plans?|get a quote|enroll now|buy now", -5),
+    # --- excluded document types: provider manuals and bulletins are not collected
+    (r"provider (?:manuals?|handbooks?|administrative (?:guides?|manuals?)|reference (?:guides?|manuals?))|administrative guide|office manual", -4),
+    (r"(?<!clinical policy )\bbulletins?\b|network news|provider news|polic(?:y|ies) (?:updates?|notifications?)|"
+     r"notices? of (?:policy )?changes?|update notifications?", -4),
+    # --- added: pages and files that look close to policies but are not
+    (r"claims? (?:forms?|submission|status|inquiry|reconsideration|dispute)|(?:enrollment|application|change|update|demographic|roster) forms?|"
+     r"\bw-?9\b|direct deposit|electronic funds|\beft\b|\bera\b enrollment|credentialing|recredentialing|become a (?:participating )?provider|"
+     r"join our network|provider enrollment|contracting", -5),
+    (r"benefit (?:booklet|guide)|certificate of coverage|schedule of benefits|plan documents?|rate sheets?|premium|id cards?", -5),
+    (r"member (?:rights|resources|services|portal|materials|education)|patient (?:education|resources)|health (?:tips|library|topics)|"
+     r"wellness|healthy living|disease management|care management programs?", -4),
+    (r"fraud|waste (?:and|&) abuse|compliance (?:plan|program)|code of conduct|\bhedis\b|\bncqa\b|quality (?:improvement|program)|star ratings?", -4),
+    (r"\bappeals?\b|grievances?|complaints?", -2),
+    (r"mail[\s-]order|home delivery|refills?|copay (?:card|savings)|coupons?|discount cards?|manufacturer (?:coupon|assistance)|"
+     r"drug (?:recalls?|shortages?|safety alerts?)", -4),
+    (r"subscribe|unsubscribe|email sign|mobile app|download (?:the )?app", -6),
 ]
 FIELD_WEIGHTS = {"anchor": 1.0, "url": 0.8, "heading": 0.6, "parent": 0.35, "page": 0.25}
 
@@ -384,6 +417,12 @@ def classify_doc_type(own: str, header: str = "", body: str = "", around: str = 
     return best_t, src[best_t], False
 
 
+def excluded_doc_type(own: str, header: str = "", body: str = "", around: str = "", policy_number: str = "") -> str:
+    """The document type from EXCLUDED_DOC_TYPES that classify_doc_type picks for this evidence, else ''."""
+    dtype = classify_doc_type(own, header, body, around, policy_number)[0]
+    return dtype if dtype in EXCLUDED_DOC_TYPES else ""
+
+
 # ---- line of business --------------------------------------------------------
 LOB_RULES: dict[str, list[str]] = {
     "Federal": [r"federal employee program", r"\bfep\b", r"\bfehbp?\b", r"\btricare\b", r"federal employees? health benefits?"],
@@ -402,7 +441,18 @@ _LOB_RX = {k: [re.compile(p, re.I) for p in v] for k, v in LOB_RULES.items()}
 LOB_HEADER_CHARS = 300   # body text is only consulted in the document header ("plasma exchange" deeper in a policy is not a LOB)
 
 
-def detect_lob(own: str, header: str, around: str) -> tuple[str, str]:
+# unambiguous cues only: used on the opening of the document when nothing else names a line of business
+_LOB_BODY_RX = {k: [re.compile(p, re.I) for p in v] for k, v in {
+    "Medicare": [r"medicare advantage", r"\bpart d\b", r"\bmapd\b"],
+    "Medicaid": [r"\bmedicaid\b", r"community plan"],
+    "Federal": [r"federal employee program", r"\bfep\b"],
+    "Exchange": [r"\bmarketplace\b", r"\bon[\s-]exchange\b"],
+    "Commercial": [r"\bcommercial (?:plans?|members?|products?|policies)\b"],
+}.items()}
+LOB_BODY_CHARS = 1500
+
+
+def detect_lob(own: str, header: str, around: str, body: str = "") -> tuple[str, str]:
     for name, text in (("title/link", own), ("document header", (header or "")[:LOB_HEADER_CHARS]), ("listing page", around)):
         if not text:
             continue
@@ -411,6 +461,9 @@ def detect_lob(own: str, header: str, around: str) -> tuple[str, str]:
             return found[0], name
         if len(found) > 1:
             return "Multiple", name
+    found = [k for k, rxs in _LOB_BODY_RX.items() if any(rx.search((body or "")[:LOB_BODY_CHARS]) for rx in rxs)]
+    if len(found) == 1:
+        return found[0], "document body"
     return "Unknown", "none"
 
 
@@ -491,7 +544,7 @@ CONTENT_POS: list[tuple[str, float]] = [
     (r"quantity limit|step therapy", 2), (r"experimental (?:or|/|and) investigational|investigational", 2),
     (r"\bapplicable codes\b|\bcoding information\b|\bbilling/coding\b", 2), (r"\breferences\b", 0.5),
     (r"\b(?:background|description|rationale|scope)\b", 0.5), (r"last review(?:ed)?|review date|revision history|policy history", 1.5),
-    (r"reimbursement|payment policy", 1.5), (r"\bguideline\b", 1), (r"provider manual|administrative guide", 2),
+    (r"reimbursement|payment policy", 1.5), (r"\bguideline\b", 1),
 ]
 CONTENT_NEG: list[tuple[str, float]] = [
     (r"notice of privacy practices|privacy notice|privacy policy", -4), (r"summary of benefits and coverage", -4),
@@ -535,12 +588,14 @@ def content_fingerprint(text: str) -> tuple[float, list[str]]:
 _MONTH = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
 DATE_PAT = (rf"(?:\d{{4}}-\d{{1,2}}-\d{{1,2}}|\d{{1,2}}[/.\-]\d{{1,2}}[/.\-]\d{{2,4}}|{_MONTH}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}|"
             rf"\d{{1,2}}\s+{_MONTH}\.?,?\s+\d{{4}}|{_MONTH}\.?,?\s+\d{{4}}|\d{{1,2}}/\d{{4}})")
-_EFFECTIVE_RX = re.compile(rf"((?:original|initial)\s+)?effective(?:\s+date)?(?:\s+of\s+(?:policy|this policy))?(?:\s+(?:on|as of))?"
+_EFFECTIVE_RX = re.compile(rf"((?:original|initial)\s+)?effective(?:\s+date)?(?:\s+of\s+(?:policy|this policy))?"
+                           rf"(?:\s+(?:for\s+(?:dates\s+of\s+service|claims?|services?)\s+)?(?:on\s+or\s+after|on|as\s+of|beginning|starting|from))?"
                            rf"\s*[:\-–]?\s*({DATE_PAT})", re.I)
 _UPDATED_RX = re.compile(
     rf"(?:last\s+(?:reviewed|review(?:\s+date)?|revised|revision(?:\s+date)?|updated|modified|approved)|review(?:ed)?\s+date|"
     rf"revision\s+date|revised(?:\s+date)?|updated(?:\s+on)?|date\s+(?:of\s+)?(?:last\s+)?(?:review|revision|update)|"
-    rf"approval\s+date|approved(?:\s+date)?)\s*(?:on)?\s*[:\-–]?\s*({DATE_PAT})", re.I)
+    rf"approval\s+date|approved(?:\s+date)?|date\s+issued|issue\s+date|(?:last\s+)?(?:reviewed|review)\s*/\s*(?:revised|revision)(?:\s+date)?|"
+    rf"(?:revised|revision)\s*/\s*(?:reviewed|review)(?:\s+date)?|policy\s+(?:last\s+)?(?:updated|revised))\s*(?:on)?\s*[:\-–]?\s*({DATE_PAT})", re.I)
 _NOT_PAST = re.compile(r"(?:next|scheduled|upcoming|due|planned|future)\s*$", re.I)
 
 
@@ -572,11 +627,10 @@ def http_date_to_iso(value: str) -> str:
     return d.astimezone(timezone.utc).strftime("%Y-%m-%d") if d.tzinfo else d.strftime("%Y-%m-%d")
 
 
-def extract_dates(text: str) -> dict[str, Any]:
+def _scan_dates(head: str) -> dict[str, Any]:
     """Labelled dates only. effective_date: the current 'Effective Date' (an 'Original Effective Date' is used only when
     nothing else is printed, and noted). last_updated_date: latest 'last reviewed / revised / updated' date that is not
     in the future and not labelled 'next review'."""
-    head = (text or "")[:10000]
     out: dict[str, Any] = {"effective_date": "", "last_updated_date": "", "notes": []}
     current, original, partial = [], [], []
     for m in _EFFECTIVE_RX.finditer(head):
@@ -614,6 +668,24 @@ def extract_dates(text: str) -> dict[str, Any]:
     return out
 
 
+def extract_dates(text: str, tail: str = "") -> dict[str, Any]:
+    """_scan_dates over the start of the document; a date still missing is looked for at the end (footer / revision
+    history / last pages) and noted as such."""
+    out = _scan_dates((text or "")[:10000])
+    if tail and not (out["effective_date"] and out["last_updated_date"]):
+        t = _scan_dates(tail[:8000])
+        if not out["effective_date"] and t["effective_date"]:
+            out["effective_date"] = t["effective_date"]
+            out["notes"] = [n for n in out["notes"] if not n.startswith("effective date printed")]
+            out["notes"] += [n for n in t["notes"] if n.startswith("effective_date is")]
+            out["notes"].append("effective_date taken from the end of the document")
+        if not out["last_updated_date"] and t["last_updated_date"]:
+            out["last_updated_date"] = t["last_updated_date"]
+            out["notes"] = [n for n in out["notes"] if not n.startswith("last review/revision date printed")]
+            out["notes"].append("last_updated_date taken from the end of the document")
+    return out
+
+
 _POLICY_LABEL_RX = re.compile(
     r"(?:medical\s+|clinical\s+|coverage\s+|payment\s+|reimbursement\s+|drug\s+|pharmacy\s+)?"
     r"(?:policy|guideline|bulletin|document|cpb|reference)\s*(?:number|no\.?|num\.?|#|id|code)\s*[:#\-–]?\s*"
@@ -644,8 +716,10 @@ def _valid_policy_number(v: str) -> bool:
     return True
 
 
-def extract_policy_number(text: str, title: str) -> tuple[str, str]:
-    """Publisher's own identifier, verbatim (leading zeros kept). Never derived from the file name."""
+def extract_policy_number(text: str, title: str, tail: str = "", url: str = "") -> tuple[str, str]:
+    """Publisher's own identifier, verbatim (leading zeros kept). Order: labelled in the first pages, a publisher format in
+    the title / first 600 chars, labelled at the end of the document, a generic id in the title, and last a publisher
+    format in the file name (source 'url', the caller notes it)."""
     head = (text or "")[:6000]
     for m in _POLICY_LABEL_RX.finditer(head):
         v = m.group(1).strip(".-_/:")
@@ -656,9 +730,19 @@ def extract_policy_number(text: str, title: str) -> tuple[str, str]:
             m = rx.search(src)
             if m and _valid_policy_number(m.group(0)):
                 return m.group(0), "format"
+    for m in _POLICY_LABEL_RX.finditer((tail or "")[:6000]):
+        v = m.group(1).strip(".-_/:")
+        if _valid_policy_number(v):
+            return v, "labeled"
     m = _GENERIC_ID_RX.search(title or "")
     if m and _valid_policy_number(m.group(0)):
         return m.group(0), "format"
+    if url:
+        path = re.sub(r"[_/]", " ", unquote(urlparse(url).path))
+        for rx in _POLICY_FORMAT_RX:
+            m = rx.search(path)
+            if m and _valid_policy_number(m.group(0)):
+                return m.group(0), "url"
     return "", ""
 
 

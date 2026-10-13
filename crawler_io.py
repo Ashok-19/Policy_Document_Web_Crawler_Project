@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover
         fitz = None
 
 from crawler_config import (BLOCK_TRACKER_REQUESTS_IN_BROWSER, FETCH_WORKERS, TRACKER_HOST_SUFFIXES, CONTACT, IDP_HOST_SUFFIXES, MAX_CRAWL_DELAY_SECONDS, MAX_EXPAND_CLICKS, MAX_PAGINATION_STEPS, MAX_PARSE_BYTES, MAX_RETRIES, MAX_SELECT_OPTIONS, MAX_SNAPSHOTS, MAX_STREAM_BYTES, MAX_TAB_CLICKS, PLAYWRIGHT_NAV_TIMEOUT_MS, REQUEST_DELAY_SECONDS, REQUEST_TIMEOUT_SECONDS, RETRY_STATUSES, TEXT_FP_MAX_PAGES, USER_AGENT, USE_OCR, USE_PLAYWRIGHT, log, utc_now_iso)
-from crawler_text import (DOC_EXTS, MAYBE_DOC_HINTS, clean_text, clean_text_keep_lines, host_has_suffix, is_cdn_host, http_date_to_iso, is_good_title, link_kind, normalize_url, sha256_hex, trim_title, url_ext, url_key)
+from crawler_text import (DOC_EXTS, MAYBE_DOC_HINTS, clean_text, clean_text_keep_lines, host_has_suffix, is_cdn_host, http_date_to_iso, is_good_title, link_kind, normalize_url, parse_date, sha256_hex, trim_title, url_ext, url_key)
 
 
 # =============================================================================
@@ -60,6 +60,8 @@ class Inspection:
     link_density: float = 0.0
     doc_links: int = 0
     notes: list[str] = field(default_factory=list)
+    tail_text: str = ""            # last pages (PDF) - footers / revision history, searched when the first pages lack a date or id
+    meta_modified: str = ""        # YYYY-MM-DD from the file's own metadata (PDF mod/creation date, HTML meta, docx core.xml)
 
 
 def sniff_file_type(data: bytes, content_type: str, url: str) -> str:
@@ -95,6 +97,15 @@ def sniff_file_type(data: bytes, content_type: str, url: str) -> str:
     return "other"   # csv / txt / rtf / unknown are not schema file types
 
 
+def _meta_date(value: str) -> str:
+    """'D:20240115103000-05'00'' / '2024-01-15T10:30:00Z' / 'Jan 15, 2024' -> YYYY-MM-DD, '' when not a plausible date."""
+    value = (value or "").strip()
+    m = re.match(r"D:(\d{4})(\d{2})(\d{2})", value)
+    if m:
+        value = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return parse_date(value[:40])[0] if value else ""
+
+
 def inspect_pdf(data: bytes, payer_alias: str) -> Inspection:
     ins = Inspection(file_type="pdf")
     if fitz is None:
@@ -121,6 +132,8 @@ def inspect_pdf(data: bytes, payer_alias: str) -> Inspection:
         n_fp = min(doc.page_count, TEXT_FP_MAX_PAGES)
         texts = [page_text(i) for i in range(n_fp)]
         ins.text = "\n".join(texts[:3])
+        ins.tail_text = "\n".join(page_text(i) for i in range(max(3, doc.page_count - 2), doc.page_count))
+        ins.meta_modified = _meta_date(meta.get("modDate", "")) or _meta_date(meta.get("creationDate", ""))
         tail = [page_text(i) for i in range(max(n_fp, doc.page_count - 2), doc.page_count)]
         ins.fp_text = "\n".join(texts + tail) + f"\n[pages {doc.page_count}]"
         if doc.page_count:
@@ -190,6 +203,15 @@ def _zip_text(data: bytes, members: list[str], limit: int) -> str:
     return clean_text_keep_lines(" ".join(out))[:limit]
 
 
+def _zip_core_modified(data: bytes) -> str:
+    try:
+        xml = zipfile.ZipFile(io.BytesIO(data)).read("docProps/core.xml").decode("utf-8", "ignore")
+        m = re.search(r"<dcterms:modified[^>]*>(.*?)</dcterms:modified>", xml, re.S)
+        return _meta_date(m.group(1)) if m else ""
+    except Exception:
+        return ""
+
+
 def _zip_core_title(data: bytes) -> str:
     try:
         xml = zipfile.ZipFile(io.BytesIO(data)).read("docProps/core.xml").decode("utf-8", "ignore")
@@ -208,6 +230,16 @@ def inspect_html(data: bytes, url: str, payer_alias: str) -> Inspection:
         ins.canonical_url = normalize_url(can.attributes.get("href") or "", url)
     title = clean_text(tree.css_first("title").text() if tree.css_first("title") else "")
     h1 = clean_text(tree.css_first("h1").text() if tree.css_first("h1") else "")
+    for sel in ('meta[property="article:modified_time"]', 'meta[property="og:updated_time"]', 'meta[name="last-modified"]',
+                'meta[name="dcterms.modified"]', 'meta[itemprop="dateModified"]', '[itemprop="dateModified"]'):
+        node = tree.css_first(sel)
+        if node is not None:
+            ins.meta_modified = _meta_date(node.attributes.get("content") or node.attributes.get("datetime") or "")
+            if ins.meta_modified:
+                break
+    if not ins.meta_modified:
+        m = re.search(r'"dateModified"\s*:\s*"([^"]{8,40})"', html)
+        ins.meta_modified = _meta_date(m.group(1)) if m else ""
     for node in tree.css("script, style, noscript, nav, header, footer, svg, form, iframe"):
         node.decompose()
     body = tree.body
@@ -240,6 +272,7 @@ def inspect_content(data: bytes, content_type: str, url: str, payer_alias: str) 
         t = _zip_core_title(data)
         if is_good_title(t, payer_alias):
             ins.meta_title = t
+        ins.meta_modified = _zip_core_modified(data)
         first = next((l for l in ins.text.splitlines()[:8] if is_good_title(l, payer_alias)), "")
         if first:
             ins.heading_title = clean_text(first, 250)

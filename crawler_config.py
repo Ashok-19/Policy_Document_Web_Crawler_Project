@@ -125,8 +125,8 @@ UNFETCHED_DOC_ROW_MIN_SCORE = 6.0 # strong candidate that could not be fetched s
 REOPEN_REJECTED_SCORE_GAIN = 99.0  # a rejected document is re-evaluated if it re-appears with this much more evidence
 
 INFER_STATE_FROM_PAYER_FOOTPRINT = True   # single-state payers: use footprint_state (noted, -0.05 confidence)
-REVISION_POLICY = "flag"          # "flag": keep every dated revision, flag latest/superseded in notes
-                                  # "latest_only": keep the latest, move superseded revisions to near_duplicates_removed
+REVISION_POLICY = "latest_only"   # "latest_only": keep the latest dated revision; older revisions and duplicates go to skipped_doc_links.csv
+                                  # "flag": keep every dated revision, flag latest/superseded in notes
 TEXT_FP_MAX_PAGES = 40            # pages used for the normalised-text fingerprint (plus the last 2 pages)
 TEXT_FP_MIN_CHARS = 500           # shorter texts get no text fingerprint (too little to compare safely)
 
@@ -193,6 +193,8 @@ ENUMS: dict[str, list[str]] = {
     "extraction_method": ["css_selector", "xpath", "regex", "json_api", "sitemap", "pdf_text", "pdf_annotation",
                           "url_pattern", "manual"],
 }
+# Document types the crawler does not collect: such candidates are written to skipped_doc_links.csv instead of the inventory.
+EXCLUDED_DOC_TYPES = ("provider_manual", "bulletin")
 STATE_NATIONAL = "National"
 STATE_JOINER = "|"
 NOTES_MAX_CHARS = 600
