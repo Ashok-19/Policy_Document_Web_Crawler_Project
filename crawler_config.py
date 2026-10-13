@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 # =============================================================================
 # 1. INPUT  (edit here - no command-line arguments)
 # =============================================================================
-HOMEPAGE_URL = "https://www.uhcprovider.com"   # the payer homepage / hint host to crawl
+HOMEPAGE_URL = "https://www.anthem.com"  # the payer homepage / hint host to crawl
 PAYER_NAME = ""            # "" -> looked up in PAYER_REGISTRY / payer_seed_list.csv by host
 RUN_ALL_PAYERS = False     # True -> ignore HOMEPAGE_URL and crawl every payer in the registry
 EXTRA_START_URLS: list[str] = []   # optional extra entry points for the payer in HOMEPAGE_URL
