@@ -26,10 +26,10 @@ try:
 except ImportError:  # pragma: no cover
     etree = None
 
-from crawler_config import (EXCLUDED_DOC_TYPES, PARALLEL_PAYERS, STOP, PREFETCH_AHEAD, BROWSER_RETRY_ON_BOT_CHALLENGE, COLUMNS, DOC_CANDIDATE_MIN_SCORE, DOC_DONE_STATES, ENUMS, EXTERNAL_DOC_MIN_SCORE, EXTRA_START_URLS, HOMEPAGE_URL, HUB_INHERIT_MAX_BONUS, HUB_INHERIT_MIN_SCORE, KNOWN_PATTERN_MIN_DOCS, LLM_FOR_MISSING_FIELDS, MAX_DEPTH, MAX_DOCUMENTS_PER_PAYER, MAX_PAGES_PER_PAYER, MAX_PARSE_BYTES, MAX_RENDERS_PER_PAYER, MAX_SITEMAP_FILES, MAX_SITEMAP_URLS, MAYBE_DOC_MIN_SCORE, NAV_FOLLOW_MIN_SCORE, NOTES_MAX_CHARS, OLLAMA_MODEL, OUTPUT_DIR, PAGE_DONE_STATES, PAGE_FOLLOW_MIN_SCORE, PAYER_NAME, PAYER_REGISTRY, ProgressUI, RELATED_DOMAIN_DEPTH_BUDGET, RELATED_DOMAIN_MIN_SCORE, RESET_PAYER_STATE, REVISION_POLICY, RUN_ALL_PAYERS, SAVE_DOCUMENT_FILES, SEED_LIST_CSV, STATE_DB, STATE_JOINER, STATE_NATIONAL, UNFETCHED_DOC_ROW_MIN_SCORE, log, setup_logging, utc_now_iso)
+from crawler_config import (RELATED_TRIAL_BRAND_PAGES, RELATED_TRIAL_MAX_PAGES, RELATED_TRIAL_MIN_DOCS, CDN_TRUST_MIN_DOCS, HUB_FAMILY_MIN_LINKS, PAGE_SKIP_RECORD_MIN_SCORE, EXCLUDED_DOC_TYPES, PARALLEL_PAYERS, STOP, PREFETCH_AHEAD, BROWSER_RETRY_ON_BOT_CHALLENGE, COLUMNS, DOC_CANDIDATE_MIN_SCORE, DOC_DONE_STATES, ENUMS, EXTERNAL_DOC_MIN_SCORE, EXTRA_START_URLS, HOMEPAGE_URL, HUB_INHERIT_MAX_BONUS, HUB_INHERIT_MIN_SCORE, KNOWN_PATTERN_MIN_DOCS, LLM_FOR_MISSING_FIELDS, MAX_DEPTH, MAX_DOCUMENTS_PER_PAYER, MAX_PAGES_PER_PAYER, MAX_PARSE_BYTES, MAX_RENDERS_PER_PAYER, MAX_SITEMAP_FILES, MAX_SITEMAP_URLS, MAYBE_DOC_MIN_SCORE, NAV_FOLLOW_MIN_SCORE, NOTES_MAX_CHARS, OLLAMA_MODEL, OUTPUT_DIR, PAGE_DONE_STATES, PAGE_FOLLOW_MIN_SCORE, PAYER_NAME, PAYER_REGISTRY, ProgressUI, RELATED_DOMAIN_DEPTH_BUDGET, RELATED_DOMAIN_MIN_SCORE, RESET_PAYER_STATE, REVISION_POLICY, RUN_ALL_PAYERS, SAVE_DOCUMENT_FILES, SEED_LIST_CSV, STATE_DB, STATE_JOINER, STATE_NATIONAL, UNFETCHED_DOC_ROW_MIN_SCORE, log, setup_logging, utc_now_iso)
 from crawler_io import (Browser, FetchResult, Fetcher, Inspection, Link, RenderResult, VIA_BY_ORIGIN, extract_links, inspect_content, inspect_html, is_auth_block, links_from_json, needs_js, sniff_file_type)
 from crawler_state import (LLMClassifier, PolicyRow, StateDB, load_schema_dictionary)
-from crawler_text import (DOC_EXTS, excluded_doc_type, THIRD_PARTY_BLOCKLIST, classify_doc_type, clean_anchor, clean_text, content_fingerprint, detect_lob, detect_state, extract_dates, extract_policy_number, html_policy_evidence, is_cdn_host, is_good_title, join_notes, link_kind, normalize_url, parse_date, reg_domain, register_brands, score_link, sha256_hex, short_url, text_fingerprint, title_from_filename, trim_title, url_ext, url_key, url_words)
+from crawler_text import (declared_count, cdn_tenant, DOC_EXTS, excluded_doc_type, THIRD_PARTY_BLOCKLIST, classify_doc_type, clean_anchor, clean_text, content_fingerprint, detect_lob, detect_state, extract_dates, extract_policy_number, html_policy_evidence, is_cdn_host, is_good_title, join_notes, link_kind, normalize_url, parse_date, reg_domain, register_brands, score_link, sha256_hex, short_url, text_fingerprint, title_from_filename, trim_title, url_ext, url_key, url_words)
 
 
 # =============================================================================
@@ -67,6 +67,47 @@ def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
 
 
+_GENERIC_BRANDS = {"health plan", "healthcare", "health care", "blue cross", "blue shield", "blue cross blue shield", "bcbs"}
+
+
+def _brand_terms(raw: list[str]) -> list[str]:
+    """Distinct usable brand strings: 'Elevance / Anthem' and 'BCBST (BCBS Tennessee)' are split into their parts."""
+    out: list[str] = []
+    for r in raw:
+        for t in re.split(r"\s*[/()]\s*", r or ""):
+            t = t.strip()
+            if len(t) >= 3 and t.lower() not in _GENERIC_BRANDS and t not in out:
+                out.append(t)
+    return out
+
+
+def _strong_brand(t: str) -> bool:
+    """Multi-word or long names are distinctive; short single words / acronyms ('UHC', 'Anthem', 'Cigna') are not."""
+    return len(t.split()) >= 2 or len(t) >= 9
+
+
+def _brand_rx(terms: list[str]) -> Optional[re.Pattern]:
+    if not terms:
+        return None
+    return re.compile(r"(?<!\w)(?:" + "|".join(re.escape(b) for b in sorted(set(terms), key=len, reverse=True)) + r")(?!\w)", re.I)
+
+
+def _plain_text(html: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>|<[^>]+>", " ", html))
+
+
+def _hub_base(url: str) -> str:
+    """A listing and its paginated / filtered variants share host + path."""
+    pu = urlparse(url)
+    return f"{(pu.hostname or '').lower()}{pu.path.rstrip('/').lower()}"
+
+
+def _family_key(url: str) -> tuple[str, str]:
+    """(host, folder) - links sharing it on one page form a listing (/policies/a, /policies/b, ...)."""
+    pu = urlparse(url)
+    return pu.hostname or "", pu.path.rstrip("/").rsplit("/", 1)[0]
+
+
 def in_scope_candidate(domain: str) -> bool:
     return domain not in THIRD_PARTY_BLOCKLIST and not domain.endswith((".gov", ".edu"))
 
@@ -80,15 +121,23 @@ class PayerCrawler:
         self.db, self.fx, self.br, self.llm, self.ui = db, fetcher, browser, llm, ui
         self.affiliated = {reg_domain(d) for d in payer.get("affiliated_domains", []) if d}
         register_brands([self.name, self.alias] + list(payer.get("brand_terms", [])))
-        brands = [b for b in [self.name, self.alias] + list(payer.get("brand_terms", [])) if b and len(b) >= 3]
-        self.brand_rx = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(b) for b in sorted(set(brands), key=len, reverse=True)) + r")(?!\w)",
-                                   re.I) if brands else None
+        own = _brand_terms([self.name, self.alias] + list(payer.get("brand_terms", [])))
+        self.brand_strong_rx = _brand_rx([t for t in own if _strong_brand(t)])
+        self.brand_weak_rx = _brand_rx([t for t in own if not _strong_brand(t)])
+        own_low = {t.lower() for t in own}
+        others = _brand_terms([t for p in PAYER_REGISTRY if p["payer_name"] != self.name
+                               for t in [p["payer_name"], p.get("payer_alias", "")] + list(p.get("brand_terms", []))])
+        self.other_brand_rx = _brand_rx([t for t in others if _strong_brand(t) and t.lower() not in own_low])
         self._load_state()
 
     def _load_state(self) -> None:
         self.home_domains: set[str] = set(self.db.get(self.name, "home_domains", [])) | self.affiliated
         self.related_domains: set[str] = set(self.db.get(self.name, "related_domains", []))
         self.home_hosts: list[str] = self.db.get(self.name, "home_hosts", [])
+        self.related_trial: dict[str, dict] = self.db.get(self.name, "related_trial", {})      # domains still on probation
+        self.hub_declared: dict[str, dict] = self.db.get(self.name, "hub_declared", {})        # hub base -> declared entry count
+        self.related_rejected: set[str] = set(self.db.get(self.name, "related_rejected", []))
+        self.cdn_proven: dict[str, int] = {k: int(v) for k, v in self.db.get(self.name, "cdn_proven", {}).items()}
         self.renders_at_start = self.br.renders
         c = self.db.status_counts(self.name)
         self.pages_done = sum(c.get(("page", s), 0) for s in PAGE_DONE_STATES)
@@ -131,6 +180,8 @@ class PayerCrawler:
     def _save_domains(self) -> None:
         self.db.put(self.name, "home_domains", sorted(self.home_domains))
         self.db.put(self.name, "related_domains", sorted(self.related_domains))
+        self.db.put(self.name, "related_trial", self.related_trial)
+        self.db.put(self.name, "related_rejected", sorted(self.related_rejected))
         self.db.put(self.name, "home_hosts", self.home_hosts)
 
     def phase_resolve(self) -> None:
@@ -337,6 +388,9 @@ class PayerCrawler:
     # ---------------------------------------------------------------- pages
     def process_page(self, item: dict) -> None:
         url, key = item["url"], item["key"]
+        if reg_domain(urlparse(url).hostname or "") in self.related_rejected:
+            self.db.finish(self.name, key, "skipped_budget", "related_domain_trial_failed")
+            return
         r = self.fx.fetch_prefetched(url)
         if r.error == "robots_disallowed":
             log(logging.INFO, "robots_disallowed", payer=self.name, url=url)
@@ -366,6 +420,10 @@ class PayerCrawler:
             self.process_document(item, prefetched=r)
             return
         html = r.content.decode(_charset(r.content_type) or "utf-8", "ignore")
+        trial_dom = reg_domain(urlparse(url).hostname or "")
+        if trial_dom in self.related_trial:
+            self._trial_page(trial_dom, html)
+        self._note_declared(item, r.final_url or url, [html])
         links, ctx = extract_links(html, r.final_url or url)
         page_url = r.final_url or url
         self._maybe_html_document(item, r, html, ctx)
@@ -400,6 +458,7 @@ class PayerCrawler:
             u = normalize_url(nav)
             if u and url_key(u) not in all_links:
                 all_links[url_key(u)] = Link(url=u, anchor=clean_text(text, 120), origin="option", label=label)
+        self._note_declared(item, page_url, [s for _, s in rr.snapshots][:3] + [rr.snapshots[-1][1]])
         self._enqueue_links(item, list(all_links.values()), ctx, page_url, extra_step=" > render:headless")
         xhr_links = 0
         for api_url, payload in rr.json_payloads:
@@ -416,7 +475,7 @@ class PayerCrawler:
                 raw = FetchResult(url=item["url"], final_url=page_url, status=rr.status or 200, first_status=rr.status or 200,
                                   content=body, content_type="text/html", sha256=sha256_hex(body), size=len(body),
                                   via_browser=True, fetched_at=rr.fetched_at or utc_now_iso())
-            self._maybe_html_document(item, raw, rr.snapshots[-1][1], ctx)
+            self._maybe_html_document(item, raw, rr.snapshots[-1][1], ctx, alt_html=[s for _, s in rr.snapshots[:-1]])
         self.db.finish(self.name, item["key"], "done", f"rendered links={len(all_links)} xhr_links={xhr_links}")
 
     def _enqueue_links(self, item: dict, links: list[Link], page_ctx: str, page_url: str, extra_step: str) -> None:
@@ -429,13 +488,18 @@ class PayerCrawler:
         if page_ctx:
             hub_score = max(hub_score, score_link("", anchor=page_ctx, is_page=True)[0])
         page_is_hub = int(item["depth"]) > 0 and hub_score >= HUB_INHERIT_MIN_SCORE
+        families: dict[tuple[str, str], int] = defaultdict(int)
+        if page_is_hub:
+            for l in links:
+                if link_kind(l.url) == "page":
+                    families[_family_key(l.url)] += 1
         for l in links:
             kind = link_kind(l.url)
             if kind == "junk":
                 continue
             host = urlparse(l.url).hostname or ""
             dom = reg_domain(host)
-            if dom in THIRD_PARTY_BLOCKLIST:
+            if dom in THIRD_PARTY_BLOCKLIST and not is_cdn_host(host):    # a CDN host is judged by the CDN rules below
                 continue
             sc, sig = score_link(l.url, l.anchor, l.heading, l.parent, page_ctx, is_page=(kind == "page"))
             via = VIA_BY_ORIGIN.get(l.origin, "css_selector")
@@ -475,6 +539,9 @@ class PayerCrawler:
                 if is_cdn_host(host) and url_ext(l.url) in DOC_EXTS:
                     sc = max(sc, DOC_CANDIDATE_MIN_SCORE)
                     sig.append("cdn_doc_baseline")
+                elif kind == "maybe_doc" and self._cdn_trusted(l.url):     # extension-less file on a CDN tenant already proven
+                    sc = max(sc, MAYBE_DOC_MIN_SCORE)
+                    sig.append("cdn_trusted_baseline")
                 # ==================================================
 
                 threshold = DOC_CANDIDATE_MIN_SCORE if kind == "doc" else MAYBE_DOC_MIN_SCORE
@@ -500,17 +567,27 @@ class PayerCrawler:
                 continue
             if in_scope:
                 follow = sc >= PAGE_FOLLOW_MIN_SCORE or (int(item["depth"]) == 0 and sc >= NAV_FOLLOW_MIN_SCORE)
+                if not follow and kind == "page" and page_is_hub and sc >= 0 and families[_family_key(l.url)] >= HUB_FAMILY_MIN_LINKS:
+                    follow = True       # plain-titled entries of a policy listing (e.g. "Abdominal Aortic Aneurysm") inherit the hub's evidence
+                    sc = round(sc + min(HUB_INHERIT_MAX_BONUS, 0.25 * hub_score), 2)
+                    sig = sig + ["hub_family"]
                 if follow:
                     self.db.enqueue(self.name, dict(url=l.url, kind="page", priority=sc - 0.5 * depth, depth=depth, budget=budget,
                                                     source_page_url=page_url, discovery_path=path, anchor=l.anchor, heading=l.heading,
                                                     page_ctx=page_ctx, link_score=sc, signals=sig,
                                                     route=route if route != "xhr_json" else "js_render", hints=hints))
-            elif sc >= RELATED_DOMAIN_MIN_SCORE and in_scope_candidate(dom):
+                elif kind == "page" and sc >= PAGE_SKIP_RECORD_MIN_SCORE:
+                    self.db.skip_link(self.name, l.url, page_url, l.anchor, sc, hub_score,
+                                      f"Page link (kind=page) not followed: score ({sc:.2f}) is below the minimum "
+                                      f"({PAGE_FOLLOW_MIN_SCORE:.2f}) for a page. Anchor text: '{clean_anchor(l.anchor)[:100]}'.",
+                                      l.heading, page_ctx)
+            elif sc >= RELATED_DOMAIN_MIN_SCORE and in_scope_candidate(dom) and dom not in self.related_rejected:
                 # off-domain hub strongly about policies (state plan site, document portal) -> related domain.
                 # Documents found there must still name the payer (brand check in _finalize).
                 self.related_domains.add(dom)
+                self.related_trial[dom] = {"pages": 0, "named": 0, "docs": 0}
                 self._save_domains()
-                log(logging.INFO, "related_domain_added", payer=self.name, domain=dom, via=l.url, score=sc)
+                log(logging.INFO, "related_domain_trial_started", payer=self.name, domain=dom, via=l.url, score=sc)
                 self.db.enqueue(self.name, dict(url=l.url, kind="page", priority=sc - 0.5 * depth, depth=depth,
                                                 budget=min(budget, RELATED_DOMAIN_DEPTH_BUDGET), source_page_url=page_url,
                                                 discovery_path=path, anchor=l.anchor, heading=l.heading, page_ctx=page_ctx,
@@ -524,16 +601,29 @@ class PayerCrawler:
                                         link_score=sc, signals=sig, route=route))
 
     # ---------------------------------------------------------------- html page as a document
-    def _maybe_html_document(self, item: dict, r: FetchResult, html: str, page_ctx: str) -> None:
+    def _maybe_html_document(self, item: dict, r: FetchResult, html: str, page_ctx: str, alt_html: Optional[list] = None) -> None:
+        """html is the main version; alt_html are other rendered states of the same page (tabs / accordions). The version
+        with the strongest policy evidence is the one recorded."""
         if int(item["depth"]) == 0:
             return
         page_url = r.final_url or item["url"]
         if self.db.doc_accepted(self.name, url_key(page_url)):
             return
-        ins = inspect_html(html.encode("utf-8", "ignore"), page_url, self.alias)
-        is_doc, cscore, csig = html_policy_evidence(ins)
-        if not is_doc:
+        best: Optional[tuple] = None
+        seen: set[str] = set()
+        for h in [html] + list(alt_html or [])[:10]:
+            data = h.encode("utf-8", "ignore")
+            digest = sha256_hex(data)
+            if digest in seen:
+                continue
+            seen.add(digest)
+            cand = inspect_html(data, page_url, self.alias)
+            ok, cs, sig = html_policy_evidence(cand)
+            if ok and (best is None or cs > best[1]):      # strict ">": the main version wins ties
+                best = (cand, cs, sig)
+        if best is None:
             return
+        ins, cscore, csig = best
         doc_item = dict(item)
         doc_item["url"] = page_url
         self._finalize(doc_item, r, ins, cscore, csig, skip_finish=True)
@@ -631,12 +721,83 @@ class PayerCrawler:
                 status=r.status, reason=r.blocked or r.error)
         self.db.finish(self.name, key, status, r.blocked or r.error or f"http_{r.status}")
 
-    def _brand_named(self, ins: Inspection, anchor: str) -> bool:
-        if self.brand_rx is None:
+    def _cdn_trusted(self, url: str) -> bool:
+        tenant = cdn_tenant(url)
+        return bool(tenant) and self.cdn_proven.get(tenant, 0) >= CDN_TRUST_MIN_DOCS
+
+    def _names_payer(self, head: str, body: str) -> bool:
+        """head = title / heading / link text / opening of the text; body = the rest of the window searched.
+        A distinctive (multi-word or long) brand name anywhere counts. A short or generic one ('UHC', 'Anthem') counts only
+        in the head, or when two different ones / three mentions appear. Either way the payer must not be outnumbered by the
+        brand names of the other registry payers (a Blue plan's document linked from another Blue plan's site)."""
+        blob = f"{head} {body}"
+        hits = [m.group(0).lower() for rx in (self.brand_strong_rx, self.brand_weak_rx) if rx is not None for m in rx.finditer(blob)]
+        if not hits:
             return False
-        blob = " ".join([ins.heading_title, ins.meta_title, " ".join(ins.titles), anchor, (ins.text or "")[:6000],
-                         (ins.fp_text or "")[-3000:]])
-        return bool(self.brand_rx.search(blob))
+        if self.brand_strong_rx is not None and self.brand_strong_rx.search(blob):
+            named = True
+        elif self.brand_weak_rx is not None and self.brand_weak_rx.search(head):
+            named = True
+        else:
+            named = len(set(hits)) >= 2 or len(hits) >= 3
+        if named and self.other_brand_rx is not None and len(self.other_brand_rx.findall(blob)) > len(hits):
+            return False
+        return named
+
+    def _brand_named(self, ins: Inspection, anchor: str) -> bool:
+        head = " ".join([ins.heading_title, ins.meta_title, " ".join(ins.titles), anchor, (ins.text or "")[:1500]])
+        body = " ".join([(ins.text or "")[1500:6000], (ins.fp_text or "")[-3000:]])
+        return self._names_payer(head, body)
+
+    def _note_declared(self, item: dict, page_url: str, htmls: list) -> None:
+        """Remember how many entries a hub page says it holds ('Showing 1-20 of 523'); hub_coverage() compares at export."""
+        if float(item.get("link_score") or 0) < HUB_INHERIT_MIN_SCORE:
+            return
+        best, snip = 0, ""
+        for h in htmls[:4]:
+            n, s = declared_count(_plain_text(h))
+            if n > best:
+                best, snip = n, s
+        if not best:
+            return
+        base = _hub_base(page_url)
+        cur = self.hub_declared.get(base)
+        if cur is None or best > cur["count"]:
+            self.hub_declared[base] = {"count": best, "text": snip, "url": page_url}
+            self.db.put(self.name, "hub_declared", self.hub_declared)
+
+    # ---------------------------------------------------------------- related-domain trial
+    def _trial_page(self, dom: str, html: str) -> None:
+        t = self.related_trial[dom]
+        t["pages"] += 1
+        text = _plain_text(html)
+        if self._names_payer(text[:1500], text[1500:6000]):
+            t["named"] += 1
+        self._trial_check(dom)
+
+    def _trial_check(self, dom: str) -> None:
+        t = self.related_trial.get(dom)
+        if t is None:
+            return
+        if t["docs"] >= RELATED_TRIAL_MIN_DOCS:
+            del self.related_trial[dom]
+            self._save_domains()
+            log(logging.INFO, "related_domain_promoted", payer=self.name, domain=dom, **t)
+            return
+        if (t["pages"] >= RELATED_TRIAL_BRAND_PAGES and t["named"] == 0) or t["pages"] >= RELATED_TRIAL_MAX_PAGES:
+            del self.related_trial[dom]
+            self.related_domains.discard(dom)
+            self.related_rejected.add(dom)
+            skipped = 0
+            for row in self.db.con.execute("SELECT key, url FROM frontier WHERE payer=? AND kind='page' AND status='pending'",
+                                           (self.name,)).fetchall():
+                if reg_domain(urlparse(row["url"]).hostname or "") == dom:
+                    self.db.finish(self.name, row["key"], "skipped_budget", "related_domain_trial_failed")
+                    skipped += 1
+            self._save_domains()
+            log(logging.WARNING, "related_domain_dropped", payer=self.name, domain=dom, skipped_pages=skipped, **t)
+        else:
+            self._save_domains()
 
     def _detect_soft_auth(self, r: FetchResult, ins: Inspection, url: str) -> bool:
         """Detect soft paywalls, click-through agreements, or session cookie requirements."""
@@ -706,7 +867,18 @@ class PayerCrawler:
         # -------- ownership: documents on hosts the payer does not own must name the payer
         host = urlparse(document_url).hostname or ""
         dom = reg_domain(host)
-        if dom not in self.home_domains and not is_cdn_host(host):
+        cdn_credit = ""
+        if dom not in self.home_domains and is_cdn_host(host):
+            tenant = cdn_tenant(document_url)
+            if self._cdn_trusted(document_url):
+                pass                                    # tenant already proven for this payer
+            elif self._brand_named(ins, anchor):
+                cdn_credit = tenant                     # counted toward trusting the tenant once the document is accepted
+                notes.append(f"hosted on CDN {tenant} (payer named in the document)")
+                penalty += 0.05
+            else:
+                return reject(f"hosted on CDN {tenant}, not yet trusted for {self.name}, and does not name {self.name}")
+        elif dom not in self.home_domains:
             if not self._brand_named(ins, anchor):
                 return reject(f"hosted on {dom} and does not name {self.name}")
             notes.append(f"hosted on {dom} (payer named in the document)")
@@ -858,6 +1030,14 @@ class PayerCrawler:
             return
         decision["upd_src"] = upd_src        
         self.db.save_doc(self.name, doc_key, document_url, True, row, decision, item.get("route", ""))
+        if dom in self.related_trial:
+            self.related_trial[dom]["docs"] += 1
+            self._trial_check(dom)
+        if cdn_credit:
+            self.cdn_proven[cdn_credit] = self.cdn_proven.get(cdn_credit, 0) + 1
+            self.db.put(self.name, "cdn_proven", self.cdn_proven)
+            if self.cdn_proven[cdn_credit] == CDN_TRUST_MIN_DOCS:
+                log(logging.INFO, "cdn_tenant_trusted", payer=self.name, tenant=cdn_credit)
         if SAVE_DOCUMENT_FILES and r.content:
             d = os.path.join(OUTPUT_DIR, "files", _safe(self.name))
             os.makedirs(d, exist_ok=True)
@@ -1552,12 +1732,55 @@ def _write_csv(data: list[dict], columns: list[str], filepath: str) -> None:
             writer.writerow({c: row.get(c, "") for c in columns})
 
 
+HUB_COVERAGE_COLUMNS = ["payer_name", "hub_url", "declared_count", "declared_text", "entries_seen", "accepted_documents",
+                        "seen_coverage", "status"]
+HUB_SHORTFALL_RATIO = 0.8
+
+
+def hub_coverage(db: StateDB) -> list[dict]:
+    """Recall signal: for every hub page that declares how many entries it holds, how many entries the crawler actually saw.
+    entries_seen = links queued or skipped from that hub (its paginated variants included; navigation links on the hub count
+    too, so a shortfall is real while a pass can be slightly generous). accepted_documents = rows whose source page is the hub."""
+    out: list[dict] = []
+    for payer in db.payers():
+        declared = db.get(payer, "hub_declared", {})
+        if not declared:
+            continue
+        seen: dict[str, int] = defaultdict(int)
+        accepted: dict[str, int] = defaultdict(int)
+        for r in db.con.execute("SELECT source_page_url FROM frontier WHERE payer=? AND source_page_url!=''", (payer,)):
+            seen[_hub_base(r[0])] += 1
+        for r in db.con.execute("SELECT s.source_page_url FROM skipped_links s WHERE s.payer=? AND s.source_page_url!='' AND NOT EXISTS "
+                                "(SELECT 1 FROM frontier f WHERE f.payer=s.payer AND f.key=s.key)", (payer,)):
+            seen[_hub_base(r[0])] += 1
+        for r in db.con.execute("SELECT row_json FROM documents WHERE payer=? AND accepted=1", (payer,)):
+            sp = json.loads(r[0] or "{}").get("source_page_url", "")
+            if sp:
+                accepted[_hub_base(sp)] += 1
+        for base, d in sorted(declared.items()):
+            n, s, a = int(d["count"]), seen.get(base, 0), accepted.get(base, 0)
+            short = s < HUB_SHORTFALL_RATIO * n
+            out.append({"payer_name": payer, "hub_url": d.get("url", base), "declared_count": n, "declared_text": d.get("text", ""),
+                        "entries_seen": s, "accepted_documents": a, "seen_coverage": f"{min(s / n, 9.99):.0%}",
+                        "status": f"SHORTFALL: {s} of {n} entries seen" if short else "OK"})
+            if short:
+                log(logging.WARNING, "hub_shortfall", payer=payer, hub=d.get("url", base), declared=n, seen=s, accepted=a)
+    return out
+
+
 def export(db: StateDB) -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     rows, removed = build_rows(db)
     qa_check(rows)
     payers = sorted(set(db.payers()) | {r["payer_name"] for r in rows})
     summaries = [summarize(db, p, rows, removed) for p in payers]
+    cov = hub_coverage(db)
+    for s in summaries:
+        mine = [c for c in cov if c["payer_name"] == s["payer_name"]]
+        s["hubs_with_declared_count"] = len(mine)
+        s["hubs_with_shortfall"] = sum(c["status"] != "OK" for c in mine)
+    if cov:
+        _write_csv(cov, HUB_COVERAGE_COLUMNS, os.path.join(OUTPUT_DIR, "hub_coverage.csv"))
     
     _write_table(rows, removed, summaries, "output")
     for p, s in zip(payers, summaries):

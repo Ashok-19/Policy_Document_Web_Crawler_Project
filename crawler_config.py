@@ -119,8 +119,15 @@ EXTERNAL_DOC_MIN_SCORE = 5.0      # documents on hosts the payer does not own ne
 PAGE_FOLLOW_MIN_SCORE = 2.0       # HTML pages at/above this are crawled
 NAV_FOLLOW_MIN_SCORE = 0.5        # depth-1 navigation links from the homepage
 RELATED_DOMAIN_MIN_SCORE = 8.5    # off-domain page must score this to open a related domain
+# A new related domain is on trial: it is promoted after RELATED_TRIAL_MIN_DOCS accepted documents and dropped (its pending
+# pages skipped) when RELATED_TRIAL_BRAND_PAGES pages never name the payer or RELATED_TRIAL_MAX_PAGES pages gave too few documents.
+RELATED_TRIAL_MIN_DOCS = 2
+RELATED_TRIAL_BRAND_PAGES = 3
+RELATED_TRIAL_MAX_PAGES = 12
 HUB_INHERIT_MIN_SCORE = 5.0       # documents on a policy hub page inherit part of the hub's score
 HUB_INHERIT_MAX_BONUS = 2.0
+HUB_FAMILY_MIN_LINKS = 6          # >= this many same-folder page links on a policy hub = a listing: every member is followed
+PAGE_SKIP_RECORD_MIN_SCORE = 1.0  # page links not followed but scoring at least this are written to skipped_doc_links.csv
 UNFETCHED_DOC_ROW_MIN_SCORE = 6.0 # strong candidate that could not be fetched still gets a (non-200) row
 REOPEN_REJECTED_SCORE_GAIN = 99.0  # a rejected document is re-evaluated if it re-appears with this much more evidence
 
@@ -130,10 +137,15 @@ REVISION_POLICY = "latest_only"   # "latest_only": keep the latest dated revisio
 TEXT_FP_MAX_PAGES = 40            # pages used for the normalised-text fingerprint (plus the last 2 pages)
 TEXT_FP_MIN_CHARS = 500           # shorter texts get no text fingerprint (too little to compare safely)
 
-# Hosts that serve files for many sites. A document here is accepted only when it is linked from an in-scope page.
+# Hosts that serve files for many sites. A document here is accepted only when it is linked from an in-scope page AND the
+# payer is proven for that CDN tenant: the document names the payer, or the tenant is already trusted (CDN_TRUST_MIN_DOCS).
+# A host here is never dropped by THIRD_PARTY_BLOCKLIST (e.g. storage.googleapis.com vs googleapis.com).
 CDN_HOST_SUFFIXES = ("azureedge.net", "azurefd.net", "cloudfront.net", "blob.core.windows.net", "akamaized.net",
                      "amazonaws.com", "ctfassets.net", "widen.net", "widencdn.net", "sitecorecontenthub.cloud", "bynder.com",
-                     "brightspotcdn.com", "cdn.prismic.io", "googleusercontent.com")
+                     "brightspotcdn.com", "cdn.prismic.io", "googleusercontent.com",
+                     "storage.googleapis.com", "fastly.net", "edgekey.net", "edgesuite.net", "akamaihd.net", "scene7.com",
+                     "sharepoint.com", "box.com", "cloudinary.com", "r2.dev", "pages.dev", "sitecorecloud.io")
+CDN_TRUST_MIN_DOCS = 2            # accepted documents (each naming the payer) on one CDN tenant before it is trusted without the check
 IDP_HOST_SUFFIXES = ("okta.com", "oktapreview.com", "auth0.com", "b2clogin.com", "login.microsoftonline.com",
                      "onelogin.com", "pingone.com", "pingidentity.com", "forgerock.io")
 

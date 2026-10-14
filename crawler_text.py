@@ -45,6 +45,25 @@ def is_cdn_host(host: str) -> bool:
     return host_has_suffix(host, CDN_HOST_SUFFIXES)
 
 
+_S3_PATH_HOST = re.compile(r"^s3[.-][a-z0-9-]*\.?amazonaws\.com$|^s3\.amazonaws\.com$")
+
+
+def cdn_tenant(url: str) -> str:
+    """Who owns the files on a shared host: the host itself (account / distribution / bucket-in-hostname), or host + first
+    path segment where one host serves many tenants by path (storage.googleapis.com/<bucket>, s3.amazonaws.com/<bucket>,
+    <tenant>.sharepoint.com/sites/<site>). '' when the URL is not on a CDN host."""
+    pu = urlparse(url)
+    host = (pu.hostname or "").lower()
+    if not is_cdn_host(host):
+        return ""
+    segs = [s for s in pu.path.split("/") if s]
+    if host == "storage.googleapis.com" or _S3_PATH_HOST.match(host):
+        return f"{host}/{segs[0].lower()}" if segs else host
+    if host.endswith("sharepoint.com") and len(segs) >= 2 and segs[0].lower() in ("sites", "teams"):
+        return f"{host}/{segs[0].lower()}/{segs[1].lower()}"
+    return host
+
+
 def clean_text(s: Optional[str], limit: int = 0) -> str:
     s = re.sub(r"\s+", " ", (s or "").replace(" ", " ")).strip()
     return s[:limit].rstrip() if limit and len(s) > limit else s
@@ -225,6 +244,7 @@ NAV_TERMS: list[tuple[str, float]] = [
     (r"utilization management|medical management|prior auth|precert|authorizations?", 2),
     (r"pharmacy (?:benefits?|resources|services|programs?)|clinical (?:resources|tools|programs)|medical (?:resources|policies)", 2),
     (r"forms (?:and|&) (?:documents|resources|guides)|documents (?:and|&) forms|document library", 2),
+    (r"polic(?:y|ies) (?:updates?|notifications?|changes)", 2),     # such pages often list the real policies; they are followed
 ]
 NEGATIVE_TERMS: list[tuple[str, float]] = [
     (r"privacy|hipaa notice|notice of privacy practices", -10), (r"terms (?:of use|and conditions|of service)", -10),
@@ -239,10 +259,6 @@ NEGATIVE_TERMS: list[tuple[str, float]] = [
     (r"transparency in coverage|machine[\s-]readable|\bmrf\b|price transparency", -6),
     (r"facebook|twitter|linkedin|instagram|youtube", -10), (r"\bsitemap\b", -2), (r"\bespa[nñ]ol\b|\bspanish\b", -0.5),
     (r"shop (?:for )?plans?|get a quote|enroll now|buy now", -5),
-    # --- excluded document types: provider manuals and bulletins are not collected
-    (r"provider (?:manuals?|handbooks?|administrative (?:guides?|manuals?)|reference (?:guides?|manuals?))|administrative guide|office manual", -4),
-    (r"(?<!clinical policy )\bbulletins?\b|network news|provider news|polic(?:y|ies) (?:updates?|notifications?)|"
-     r"notices? of (?:policy )?changes?|update notifications?", -4),
     # --- added: pages and files that look close to policies but are not
     (r"claims? (?:forms?|submission|status|inquiry|reconsideration|dispute)|(?:enrollment|application|change|update|demographic|roster) forms?|"
      r"\bw-?9\b|direct deposit|electronic funds|\beft\b|\bera\b enrollment|credentialing|recredentialing|become a (?:participating )?provider|"
@@ -256,11 +272,20 @@ NEGATIVE_TERMS: list[tuple[str, float]] = [
      r"drug (?:recalls?|shortages?|safety alerts?)", -4),
     (r"subscribe|unsubscribe|email sign|mobile app|download (?:the )?app", -6),
 ]
+# Excluded document types (provider manuals, bulletins). These lower the score of a DOCUMENT link only: a page about them can
+# still be a hub that lists real policies ("Policy updates" pages), so page-following scores ignore them. The exclusion itself
+# is done by excluded_doc_type() on the link text and again on the downloaded content.
+DOC_ONLY_NEGATIVE_TERMS: list[tuple[str, float]] = [
+    (r"provider (?:manuals?|handbooks?|administrative (?:guides?|manuals?)|reference (?:guides?|manuals?))|administrative guide|office manual", -4),
+    (r"(?<!clinical policy )\bbulletins?\b|network news|provider news|polic(?:y|ies) (?:updates?|notifications?)|"
+     r"notices? of (?:policy )?changes?|update notifications?", -4),
+]
 FIELD_WEIGHTS = {"anchor": 1.0, "url": 0.8, "heading": 0.6, "parent": 0.35, "page": 0.25}
 
 _POS = [(re.compile(p, re.I), w) for p, w in POSITIVE_TERMS]
 _NAV = [(re.compile(p, re.I), w) for p, w in NAV_TERMS]
 _NEG = [(re.compile(p, re.I), w) for p, w in NEGATIVE_TERMS]
+_NEG_DOC = [(re.compile(p, re.I), w) for p, w in DOC_ONLY_NEGATIVE_TERMS]
 
 GENERIC_ANCHORS = re.compile(
     r"^(?:pdf|download|download pdf|click here|here|view|view pdf|view document|open|read more|learn more|"
@@ -277,7 +302,7 @@ def _match_terms(text: str, terms: list[tuple[re.Pattern, float]]) -> tuple[floa
     return total, hits
 
 
-_TERMSET_NAMES = {"pos": "_POS", "nav": "_NAV", "neg": "_NEG"}
+_TERMSET_NAMES = {"pos": "_POS", "nav": "_NAV", "neg": "_NEG", "negdoc": "_NEG_DOC"}
 
 
 @lru_cache(maxsize=200000)
@@ -305,6 +330,9 @@ def score_link(url: str, anchor: str = "", heading: str = "", parent: str = "", 
         text = text.lower()
         pos, ph = _mt(text, "pos")
         neg, nh = _mt(text, "neg")
+        if not is_page:      # see DOC_ONLY_NEGATIVE_TERMS
+            nd, ndh = _mt(text, "negdoc")
+            neg, nh = neg + nd, nh + ndh
         if neg < 0 and pos <= 2:   # "policy" alone is a trap ("privacy policy")
             pos = 0
         total = pos + neg
@@ -320,6 +348,33 @@ def score_link(url: str, anchor: str = "", heading: str = "", parent: str = "", 
         score += 1.5
         signals.append(f"ext:{url_ext(url)}")
     return round(score, 2), signals[:12]
+
+
+_DECLARED_RX = [
+    re.compile(r"\d[\d,]*\s*(?:-|–|to)\s*\d[\d,]*\s+of\s+([\d,]{2,9})\b", re.I),                       # 1-20 of 523
+    re.compile(r"\b(?:showing|displaying|viewing)\s+\d[\d,]*\s+of\s+([\d,]{2,9})\b", re.I),             # showing 20 of 523
+    re.compile(r"\b(?:total|of)\s*:?\s*([\d,]{2,9})\s+(?:results?|items?|documents?|policies|policy|guidelines?|forms?|"
+               r"records?|entries|matches|files?)\b", re.I),                                           # of 523 policies
+    re.compile(r"\b([\d,]{2,9})\s+(?:results?|documents?|policies|guidelines?|forms?|records?|matches)\s+"
+               r"(?:found|available|total|match)", re.I),                                              # 523 results found
+    re.compile(r"\bfound\s+([\d,]{2,9})\s+(?:results?|documents?|policies|guidelines?|forms?|records?|matches)\b", re.I),
+]
+
+
+def declared_count(text: str) -> tuple[int, str]:
+    """The number of entries a listing page says it holds ('Showing 1-20 of 523', '523 policies found'), else (0, '').
+    The largest plausible figure wins; bare years and tiny numbers are ignored."""
+    head = (text or "")[:60000]
+    best, snip = 0, ""
+    for rx in _DECLARED_RX:
+        for m in rx.finditer(head):
+            raw = m.group(1)
+            n = int(raw.replace(",", ""))
+            if n < 10 or n > 500000 or ("," not in raw and 1990 <= n <= 2035):
+                continue
+            if n > best:
+                best, snip = n, clean_text(m.group(0), 80)
+    return best, snip
 
 
 @lru_cache(maxsize=262144)
@@ -567,7 +622,9 @@ def html_policy_evidence(ins: "Inspection") -> tuple[bool, float, list[str]]:
     least two distinct document markers (policy number, effective date, medical necessity, CPT/HCPCS, tiers ...)."""
     text = ins.nonlink_text or ""
     cs, sig = content_fingerprint(text)
-    is_index = ins.link_density > 0.35 or ins.doc_links >= 8 or len(text) < 600
+    # many document links alone do not make an index (a policy page can carry a Related Documents / History sidebar):
+    # it is an index only when the prose left after removing link text is thin
+    is_index = ins.link_density > 0.35 or len(text) < 600 or (ins.doc_links >= 8 and len(text) < 2000)
     strong = len({m.group(0).lower() for m in _STRONG_DOC_MARKERS.finditer(text[:8000])})
     return (not is_index and cs >= 5 and strong >= 2), cs, sig
 

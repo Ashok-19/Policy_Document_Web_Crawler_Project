@@ -221,6 +221,17 @@ def _zip_core_title(data: bytes) -> str:
         return ""
 
 
+def _inside(node: Node, tags: tuple[str, ...], max_up: int = 12) -> bool:
+    cur = node.parent
+    for _ in range(max_up):
+        if cur is None:
+            return False
+        if cur.tag in tags:
+            return True
+        cur = cur.parent
+    return False
+
+
 def inspect_html(data: bytes, url: str, payer_alias: str) -> Inspection:
     ins = Inspection(file_type="html")
     html = data.decode("utf-8", "ignore") if isinstance(data, bytes) else data
@@ -240,8 +251,12 @@ def inspect_html(data: bytes, url: str, payer_alias: str) -> Inspection:
     if not ins.meta_modified:
         m = re.search(r'"dateModified"\s*:\s*"([^"]{8,40})"', html)
         ins.meta_modified = _meta_date(m.group(1)) if m else ""
-    for node in tree.css("script, style, noscript, nav, header, footer, svg, form, iframe"):
+    for node in tree.css("script, style, noscript, nav, svg, form, iframe, #onetrust-consent-sdk, #CybotCookiebotDialog, "
+                         ".cookie-banner, .cookie-consent"):
         node.decompose()
+    for node in tree.css("header, footer"):      # page chrome only: a header/footer inside <main>/<article> carries title, dates, policy no.
+        if not _inside(node, ("main", "article")):
+            node.decompose()
     body = tree.body
     text = clean_text_keep_lines(body.text(separator="\n", strip=True) if body else "")
     ins.text = text[:20000]
