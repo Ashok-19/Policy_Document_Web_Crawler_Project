@@ -636,6 +636,36 @@ class PayerCrawler:
                          (ins.fp_text or "")[-3000:]])
         return bool(self.brand_rx.search(blob))
 
+    def _detect_soft_auth(self, r: FetchResult, ins: Inspection, url: str) -> bool:
+        """Detect soft paywalls, click-through agreements, or session cookie requirements."""
+        # 1. Session tokens in URL
+        low_url = url.lower()
+        session_tokens = ("jsessionid", "phpsessid", "aspsessionid", "sessionid=", "cfid=", "cftoken=")
+        if any(tok in low_url for tok in session_tokens):
+            return True
+        
+        # 2. Session/Auth cookies in response headers
+        cookies = r.headers.get("set-cookie", "")
+        if re.search(r"(?i)(jsessionid|phpsessid|aspsessionid|sessionid|cfid|cftoken|auth=|token=|sess=)", cookies):
+            return True
+
+        # 3. Soft paywall / click-through indicators in the document text
+        text_blob = (ins.text or "")[:4000].lower()
+        soft_auth_patterns = [
+            r"\bclick\s+(?:here\s+)?to\s+accept\b",
+            r"\bagree\s+to\s+terms\b",
+            r"\baccept\s+agreement\b",
+            r"\bsubscriber\s+only\b",
+            r"\bmember\s+login\b",
+            r"\bplease\s+(?:log|sign)\s+in\s+to\s+(?:view|access|download)\b",
+            r"\bregister\s+to\s+view\b",
+            r"\blogin\s+to\s+continue\b"
+        ]
+        if any(re.search(p, text_blob) for p in soft_auth_patterns):
+            return True
+            
+        return False
+
     def _finalize(self, item: dict, r: FetchResult, ins: Inspection, cscore: float, csig: list,
                   skip_finish: bool = False) -> None:
         key, url = item["key"], item["url"]
@@ -806,8 +836,12 @@ class PayerCrawler:
         if conf < 0.70 and not notes:
             notes.append(f"confidence {conf:.2f}: {reason}")
         file_type = ins.file_type if ins.file_type in ENUMS["file_type"] else "other"
+        requires_auth = "Y" if self._detect_soft_auth(r, ins, document_url) else "N"
+        if requires_auth == "Y":
+            notes.append("document appears to be behind a soft paywall, click-through, or session wall")
+            
         row = self._row(item, title=title, dtype=dtype, lob=lob, state=state, file_type=file_type, policy_number=pnum,
-                        eff=eff, upd=upd, requires_auth="N", methods=methods, conf=conf, notes=notes,
+                        eff=eff, upd=upd, requires_auth=requires_auth, methods=methods, conf=conf, notes=notes,
                         document_url=document_url, http_status=r.status, content_hash=r.sha256, size=r.size,
                         render_mode=render_mode, fetched_at=r.fetched_at)
         if row is None:

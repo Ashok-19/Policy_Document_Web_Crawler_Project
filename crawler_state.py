@@ -13,10 +13,12 @@ import sqlite3
 from datetime import datetime
 from pydantic import BaseModel, field_validator, model_validator
 from typing import Any, Optional
-
+import threading
 from crawler_config import (COLUMNS, ENUMS, LLM_MAX_ATTEMPTS, LLM_NUM_CTX, LLM_NUM_PREDICT, LLM_TIMEOUT_SECONDS, MAX_LLM_CALLS_PER_PAYER, OLLAMA_MODEL, OLLAMA_URL, REOPEN_REJECTED_SCORE_GAIN, SCHEMA_DICTIONARY_XLSX, STATE_JOINER, STATE_NATIONAL, USE_LLM, log, utc_now_iso)
 from crawler_text import (USPS_CODES, clean_text, sha256_hex, url_key)
 
+
+_DB_INIT_LOCK = threading.Lock()
 
 # =============================================================================
 # 12. LLM (Gate 3) - Ollama + Qwen2.5, ambiguous cases only, with a JSON repair parser
@@ -305,9 +307,9 @@ class LLMClassifier:
             if fmt is not None:
                 payload["format"] = fmt
             try:
-                self.calls += 1
                 r = self.http.post(f"{OLLAMA_URL}/api/chat", json=payload)
                 r.raise_for_status()
+                self.calls += 1  # Only count successful API responses to prevent burnout on timeouts
                 last_raw = ((r.json() or {}).get("message") or {}).get("content", "") or ""
             except httpx.ConnectError as e:
                 log(logging.WARNING, "llm_connection_lost", error=str(e)[:150])
@@ -338,35 +340,36 @@ class LLMClassifier:
 class StateDB:
     def __init__(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        self.con = sqlite3.connect(path, timeout=30)
-        self.con.row_factory = sqlite3.Row
-        self.con.executescript("""
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=NORMAL;      -- WAL + NORMAL: no fsync per commit, still crash-safe for the checkpoint
-        PRAGMA temp_store=MEMORY;
-        PRAGMA cache_size=-65536;
-        PRAGMA mmap_size=268435456;
-        PRAGMA busy_timeout=30000;
-        CREATE TABLE IF NOT EXISTS frontier(
-            payer TEXT, key TEXT, url TEXT, kind TEXT, priority REAL, depth INT, budget INT,
-            source_page_url TEXT, discovery_path TEXT, anchor TEXT, heading TEXT, page_ctx TEXT,
-            hints TEXT, link_score REAL, signals TEXT, render_mode TEXT, route TEXT,
-            status TEXT DEFAULT 'pending', reason TEXT, updated_at TEXT, PRIMARY KEY(payer, key));
-        CREATE INDEX IF NOT EXISTS ix_frontier ON frontier(payer, status, priority);
-        CREATE INDEX IF NOT EXISTS ix_frontier_kind ON frontier(payer, kind, status);
-        CREATE INDEX IF NOT EXISTS ix_frontier_pick ON frontier(payer, kind, status, priority DESC, depth);
-        CREATE TABLE IF NOT EXISTS documents(
-            payer TEXT, key TEXT, document_url TEXT, accepted INT, row_json TEXT, content_hash TEXT,
-            decision TEXT, route TEXT, created_at TEXT, PRIMARY KEY(payer, key));
-        CREATE TABLE IF NOT EXISTS skipped_links(
-            payer TEXT, key TEXT, url TEXT, source_page_url TEXT, anchor TEXT, score REAL, hub_score REAL,
-            reason TEXT, at TEXT, heading TEXT, page_context TEXT, PRIMARY KEY(payer, key));
-        CREATE TABLE IF NOT EXISTS phases(payer TEXT, phase TEXT, done_at TEXT, PRIMARY KEY(payer, phase));
-        CREATE TABLE IF NOT EXISTS kv(payer TEXT, k TEXT, v TEXT, PRIMARY KEY(payer, k));
-        CREATE TABLE IF NOT EXISTS blocked_pages(payer TEXT, url TEXT, reason TEXT, status INT, at TEXT, PRIMARY KEY(payer, url));
-        CREATE TABLE IF NOT EXISTS llm_cache(k TEXT PRIMARY KEY, v TEXT);
-        """)
-        self.con.commit()
+        with _DB_INIT_LOCK:
+            self.con = sqlite3.connect(path, timeout=30)
+            self.con.row_factory = sqlite3.Row
+            self.con.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;      -- WAL + NORMAL: no fsync per commit, still crash-safe for the checkpoint
+            PRAGMA temp_store=MEMORY;
+            PRAGMA cache_size=-65536;
+            PRAGMA mmap_size=268435456;
+            PRAGMA busy_timeout=30000;
+            CREATE TABLE IF NOT EXISTS frontier(
+                payer TEXT, key TEXT, url TEXT, kind TEXT, priority REAL, depth INT, budget INT,
+                source_page_url TEXT, discovery_path TEXT, anchor TEXT, heading TEXT, page_ctx TEXT,
+                hints TEXT, link_score REAL, signals TEXT, render_mode TEXT, route TEXT,
+                status TEXT DEFAULT 'pending', reason TEXT, updated_at TEXT, PRIMARY KEY(payer, key));
+            CREATE INDEX IF NOT EXISTS ix_frontier ON frontier(payer, status, priority);
+            CREATE INDEX IF NOT EXISTS ix_frontier_kind ON frontier(payer, kind, status);
+            CREATE INDEX IF NOT EXISTS ix_frontier_pick ON frontier(payer, kind, status, priority DESC, depth);
+            CREATE TABLE IF NOT EXISTS documents(
+                payer TEXT, key TEXT, document_url TEXT, accepted INT, row_json TEXT, content_hash TEXT,
+                decision TEXT, route TEXT, created_at TEXT, PRIMARY KEY(payer, key));
+            CREATE TABLE IF NOT EXISTS skipped_links(
+                payer TEXT, key TEXT, url TEXT, source_page_url TEXT, anchor TEXT, score REAL, hub_score REAL,
+                reason TEXT, at TEXT, heading TEXT, page_context TEXT, PRIMARY KEY(payer, key));
+            CREATE TABLE IF NOT EXISTS phases(payer TEXT, phase TEXT, done_at TEXT, PRIMARY KEY(payer, phase));
+            CREATE TABLE IF NOT EXISTS kv(payer TEXT, k TEXT, v TEXT, PRIMARY KEY(payer, k));
+            CREATE TABLE IF NOT EXISTS blocked_pages(payer TEXT, url TEXT, reason TEXT, status INT, at TEXT, PRIMARY KEY(payer, url));
+            CREATE TABLE IF NOT EXISTS llm_cache(k TEXT PRIMARY KEY, v TEXT);
+            """)
+            self.con.commit()
 
     def reset_payer(self, payer: str) -> None:
         for t in ("frontier", "documents", "phases", "kv", "blocked_pages", "skipped_links"):
