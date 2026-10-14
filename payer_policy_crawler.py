@@ -17,7 +17,9 @@ import traceback
 from collections import defaultdict
 from pydantic import ValidationError
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from datetime import date as _date, timedelta
+from urllib.parse import urlparse, unquote     
+import crawler_text as _ct
 
 try:
     from lxml import etree
@@ -787,6 +789,9 @@ class PayerCrawler:
         dates = extract_dates(text, ins.tail_text)
         notes += dates["notes"]
         eff, upd = dates["effective_date"], dates["last_updated_date"]
+        upd_src = ""                                                                  # NEW
+        if upd:                                                                       # NEW
+            upd_src = "tail" if any("last_updated_date taken from the end" in n for n in dates["notes"]) else "printed"   # NEW
         if not eff and hints.get("effective_date"):
             d, kind = parse_date(str(hints["effective_date"])[:25])
             if d:
@@ -797,15 +802,18 @@ class PayerCrawler:
             d, _ = parse_date(str(hints["last_updated_date"])[:25])
             if d:
                 upd = d
+                upd_src = "index"                                                     # NEW
                 notes.append("last_updated_date from the site's document index (JSON)")
         if not upd and ins.meta_modified:
             upd = ins.meta_modified
+            upd_src = "file_meta"                                                     # NEW
             notes.append("last_updated_date from the file's own metadata (none printed)")
         if upd and r.last_modified and r.last_modified != upd:
             notes.append(f"printed revision date {upd}; HTTP Last-Modified {r.last_modified}")
         elif not upd and r.last_modified:
             upd = r.last_modified
-            notes.append("last_updated_date from HTTP Last-Modified (none printed)")
+            upd_src = "http"                                                          # NEW
+            notes.append("last_updated_date from HTTP Last-Modified (none printed)")        
         if r.truncated:
             notes.append(f"only the first {MAX_PARSE_BYTES // (1024 * 1024)} MB were parsed; hash/size cover the full file")
         if document_url != url:
@@ -848,6 +856,7 @@ class PayerCrawler:
             if not skip_finish:
                 self.db.finish(self.name, key, "failed", "row_validation_failed")
             return
+        decision["upd_src"] = upd_src        
         self.db.save_doc(self.name, doc_key, document_url, True, row, decision, item.get("route", ""))
         if SAVE_DOCUMENT_FILES and r.content:
             d = os.path.join(OUTPUT_DIR, "files", _safe(self.name))
@@ -987,9 +996,11 @@ def _merge_into(keep: dict, others: list[dict]) -> None:
         _add_note(keep, "line_of_business taken from an identical copy's listing")
     for c in ("policy_number", "effective_date", "last_updated_date"):
         if not keep[c]:
-            v = next((r[c] for r in others if r[c]), "")
-            if v:
-                keep[c] = v
+            donor = next((r for r in others if r[c]), None)
+            if donor:
+                keep[c] = donor[c]
+                if c == "last_updated_date":
+                    keep["_upd_src"] = donor.get("_upd_src", "") or "unknown"
     urls = [r["document_url"] for r in others]
     shown = ", ".join(urls[:2]) + (f" (+{len(urls) - 2} more, see near_duplicates_removed)" if len(urls) > 2 else "")
     _add_note(keep, f"same document also at {len(urls)} other URL(s): {shown}")
@@ -1014,82 +1025,346 @@ def _collapse(rows: list[dict], keyfn: Callable[[dict], Any], rule: str, reason:
     return [r for r in rows if id(r) not in drop]
 
 
-def _family(pn: str) -> str:
-    pn = pn.strip().upper()
-    # 1. UHC specific pattern
-    m = re.fullmatch(r"20\d{2}([A-Z]\d{4})[A-Z0-9]{0,3}", pn)
-    if m:
-        return m.group(1)
-    
-    # 2. Generic: Remove 4-digit years (19xx or 20xx) to group revisions like POL-2024-001 and POL-2023-001
-    stripped = re.sub(r"\b(?:19|20)\d{2}\b", "", pn)
-    # Clean up separators left behind by year removal
-    stripped = re.sub(r"[-_.\s]+", "-", stripped).strip("-")
-    # Remove trailing revision indicators like -R, -V, -A, -REV
-    stripped = re.sub(r"[-](?:R|V|REV|A|B|C|D|E)\d*$", "", stripped, flags=re.I)
-    
-    if stripped and len(stripped) >= 2:
-        return stripped
-    return pn
+# =============================================================================
+# 16b. REVISION SUPERSEDING  (replaces _family, _title_norm and _revisions)
+#
+# Goal: keep the NEWEST version of one document, move strictly older versions of that SAME document to the skipped
+# list, and NEVER move a document that is not provably an older version of a kept document.
+#
+# A row R is removed only if ONE specific newer row K, which stays in the output, passes EVERY gate against it:
+#   G0  trust      R and K were fetched (200), need no login, and carry a last_updated_date that was really PRINTED
+#                  (or comes from the site's own index) - never file metadata / HTTP Last-Modified / a future date.
+#   G1  scope      same payer, document_type, state_or_region and line_of_business.
+#   G2  identity   same document, proven by the policy number (exact -> version/year stripped -> letter-suffix core);
+#                  the weaker the number evidence, the stricter the title must agree.  No policy number = no removal
+#                  (title-only matching exists but is OFF by default).
+#   G3  date       K.last_updated_date is strictly newer than R.last_updated_date.  effective_date is never used to
+#                  order or group.
+#   G4  version    the year tag inside the policy number (if any) must not run backwards against the dates.
+#   G5  pending    a newer row that is not yet effective does not replace the row that is still in force.
+#   G6  unambiguous every row that passes G1-G5 for R must itself be the same document; if R matches two different
+#                  documents, R is kept.
+# If any gate fails, BOTH rows are kept.  Every decision is written to REVISION_AUDIT_LOG (-> revision_audit.csv).
+# =============================================================================
+REVISION_TITLE_ONLY_FALLBACK = False        # True: rows WITHOUT a policy number may be compared on a very strict title match
+REVISION_KEEP_WHEN_NEWER_IS_PENDING = True  # G5 on/off
+REVISION_MIN_GAP_DAYS = 1                   # newer must be at least this many days newer
+REVISION_TRUSTED_DATE_SRC = frozenset({"printed", "tail", "index"})   # see _upd_source()
+REVISION_AUDIT_LOG: list[dict] = []
+
+_ISO_D = re.compile(r"\d{4}-\d{2}-\d{2}")
+_MONTHS_RX = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|"
+              r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+# Only pure VERSION MARKERS are noise. Clinically meaningful words ('revision' surgery, 'review', 'new', 'current') are kept.
+_T_NOISE = re.compile(r"\b(?:19|20)\d{2}\b|\bv(?:ersion)?\s*\d+(?:\.\d+)*\b|\brev\.?\s*\d+\b|"
+                      r"\b(?:revised|updated|archived|draft|effective|replaces|supersedes)\b|\b" + _MONTHS_RX + r"\b", re.I)
+_T_STOP = frozenset("a an and or of the for in on to with by at from policy policies medical clinical coverage guideline "
+                    "guidelines document bulletin".split())
+_ROMAN = frozenset({"ii", "iii", "iv", "vi", "vii", "viii", "ix", "x"})
 
 
-def _title_norm(t: str) -> str:
-    t = re.sub(r"\b(?:19|20)\d{2}\b|\bv(?:ersion)?\s*\d+(?:\.\d+)*\b|\b(?:rev(?:ised|ision)?|updated?|archived?|current|new|draft)\b",
-               " ", (t or "").lower())
-    return re.sub(r"[^a-z0-9]+", " ", t).strip()
+def _upd_source(r: dict) -> str:
+    """Where last_updated_date came from. Preferred: the structured value stored by _finalize (row['_upd_src']).
+    Fallback for older state DBs: the provenance note. Unknown provenance is treated as untrusted."""
+    s = r.get("_upd_src")
+    if s:
+        return s
+    if not r.get("last_updated_date"):
+        return ""
+    n = r.get("notes") or ""
+    if "last_updated_date from HTTP Last-Modified" in n:
+        return "http"
+    if "last_updated_date from the file's own metadata" in n:
+        return "file_meta"
+    if "last_updated_date from the site's document index" in n:
+        return "index"
+    if "last_updated_date taken from the end of the document" in n:
+        return "tail"
+    return "unknown" if n.endswith("…") else "printed"      # truncated notes: provenance may be lost -> untrusted
+
+
+def _trusted_upd(r: dict) -> str:
+    d = r.get("last_updated_date") or ""
+    if not _ISO_D.fullmatch(d) or d > (_date.today() + timedelta(days=1)).isoformat():
+        return ""
+    return d if _upd_source(r) in REVISION_TRUSTED_DATE_SRC else ""
+
+
+def _pn_canon(pn: str) -> str:
+    return "-".join(re.findall(r"[A-Z0-9]+", (pn or "").upper()))
+
+
+def _pn_keys(pn: str, upd: str) -> tuple[dict[str, set], Optional[int]]:
+    """Identity keys of a policy number, in three strengths, plus the year tag found in it (or None).
+    E (exact): the canonical number.   S (stem): + 'POL-2024-001' -> 'POL-001', 'MED-123-V2' -> 'MED-123', separators dropped.
+    C (core): + a glued letter suffix removed, 'T0547R' -> 'T0547'.
+    A 4-digit token counts as a YEAR only if it is within +-1 of the document's own printed date - so MP-2001 / MP-2002
+    (sequence numbers) are never reduced to 'MP'.  A stripped form must still look like an id (>= 4 chars, a letter and a digit).
+    Trailing letters after a separator (DRUG-123-A / DRUG-123-B) are NOT stripped: those are different documents."""
+    base = _pn_canon(pn)
+    keys: dict[str, set] = {"E": set(), "S": set(), "C": set()}
+    flat = base.replace("-", "")
+    if len(flat) < 3 or not re.search(r"\d", flat):
+        return keys, None
+    keys["E"].add(base)
+    fit = {int(upd[:4]) + d for d in (-1, 0, 1)} if upd[:4].isdigit() else set()
+    ypn: Optional[int] = None
+
+    def valid(s: str) -> bool:
+        f = s.replace("-", "")
+        return len(f) >= 4 and bool(re.search(r"\d", f)) and bool(re.search(r"[A-Z]", f))
+
+    def strip_rev(toks: list[str]) -> list[str]:
+        t = list(toks)
+        if len(t) > 1 and re.fullmatch(r"(?:V|VER|VERSION|REV|REVISION|R)\d{1,2}", t[-1]):
+            t.pop()
+        elif len(t) > 2 and re.fullmatch(r"\d{1,2}", t[-1]) and re.fullmatch(r"(?:V|VER|VERSION|REV|REVISION|R)\d{1,2}", t[-2]):
+            t = t[:-2]
+        return t
+
+    def strip_year(toks: list[str]) -> tuple[list[str], Optional[int]]:
+        out, found = [], None
+        for i, t in enumerate(toks):
+            if found is None and re.fullmatch(r"(?:19|20)\d{2}", t) and int(t) in fit:
+                found = int(t)
+                continue
+            m = re.match(r"^((?:19|20)\d{2})(?=[A-Z])", t) if i == 0 else None
+            if found is None and m and int(m.group(1)) in fit:
+                found, t = int(m.group(1)), t[4:]
+            out.append(t)
+        return out, found
+
+    toks = base.split("-")
+    variants = {base}
+    r1 = strip_rev(toks)
+    y1, yv = strip_year(toks)
+    y2, yv2 = strip_year(r1)
+    for v in ("-".join(r1), "-".join(y1), "-".join(y2)):
+        if v and valid(v):
+            variants.add(v)
+    ypn = yv if yv is not None else yv2
+    for v in list(variants):
+        keys["S"].add(v)
+        if valid(v.replace("-", "")):
+            keys["S"].add(v.replace("-", ""))
+    keys["C"] |= keys["S"]
+    for v in list(keys["S"]):
+        m = re.fullmatch(r"([A-Z]{1,3}\d{3,6})[A-Z]{1,3}", v)       # glued suffix only (no separator)
+        if m and valid(m.group(1)):
+            keys["C"].add(m.group(1))
+    return keys, ypn
+
+
+def _title_sig(t: str) -> tuple[frozenset, frozenset]:
+    low = (t or "").lower()
+    brand = getattr(_ct, "_BRAND_RX", None)
+    if brand is not None:
+        low = brand.sub(" ", low)
+    low = _T_NOISE.sub(" ", low)
+    words, nums = set(), set()
+    for w in re.findall(r"[a-z0-9]+", low):
+        if w in _T_STOP:
+            continue
+        if w.isdigit() or w in _ROMAN:
+            nums.add(w)
+            continue
+        if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        words.add(w)
+    return frozenset(words), frozenset(nums)
+
+
+def _title_match(a: tuple, b: tuple, level: str) -> bool:
+    """lenient (exact policy number) | medium (stem) | strict (core / title-only). Numbers / roman numerals in a title
+    ('Part 2', 'Volume II') must agree, so numbered parts of a series are never merged."""
+    (wa, na), (wb, nb) = a, b
+    if not wa or not wb:
+        return False
+    if na != nb and (level != "lenient" or (na and nb)):
+        return False
+    if wa == wb:
+        return True
+    if level == "strict":
+        return False
+    small = min(len(wa), len(wb))
+    if small < 2:
+        return False
+    inter = len(wa & wb)
+    cont, jac = inter / small, inter / len(wa | wb)
+    return (cont >= 0.75 and jac >= 0.5) if level == "lenient" else (cont >= 0.85 and jac >= 0.7)
+
+
+def _url_stem(url: str) -> str:
+    p = urlparse(url or "")
+    path = re.sub(r"\.[a-z0-9]{2,5}$", "", unquote(p.path or "").lower())
+    path = re.sub(r"(?:19|20)\d{2}|v\d+(?:\.\d+)*|rev\d*|" + _MONTHS_RX, " ", path)
+    return (p.hostname or "") + "/" + re.sub(r"[^a-z]+", "-", path).strip("-")
+
+
+def _rev_meta(r: dict) -> dict:
+    upd = _trusted_upd(r)
+    keys, ypn = _pn_keys(r.get("policy_number") or "", upd)
+    sig = _title_sig(r.get("document_title") or "")
+    return {"upd": upd, "keys": keys, "ypn": ypn, "has_pn": bool(keys["E"]), "sig": sig,
+            "ustem": _url_stem(r.get("document_url") or ""), "src": _upd_source(r)}
+
+
+def _scope_ok(a: dict, b: dict, level: str) -> bool:
+    if a["payer_name"] != b["payer_name"] or a["document_type"] != b["document_type"]:
+        return False
+    if a["state_or_region"] != b["state_or_region"]:
+        return False
+    la, lb = a["line_of_business"], b["line_of_business"]
+    return la == lb or (level == "exact" and "Unknown" in (la, lb))   # an undetected LOB may match only on an exact number
+
+
+def _titles_ok(a: dict, b: dict, ma: dict, mb: dict, tier: str) -> bool:
+    level = {"E": "lenient", "S": "medium", "C": "strict"}[tier]
+    if not ma["sig"][0] or not mb["sig"][0]:         # generic / empty titles: only the file-name stem can corroborate
+        return tier == "E" and bool(ma["ustem"]) and ma["ustem"] == mb["ustem"]
+    return _title_match(ma["sig"], mb["sig"], level)
+
+
+def _identity(a: dict, b: dict, ma: dict, mb: dict) -> Optional[tuple[str, str]]:
+    """Strongest proof that a and b are the same document -> (level, evidence) or None."""
+    if ma["has_pn"] and mb["has_pn"]:
+        for level, tier in (("exact", "E"), ("stem", "S"), ("core", "C")):
+            shared = ma["keys"][tier] & mb["keys"][tier]
+            if shared:                                   # weaker tiers only demand more, so the first shared tier decides
+                if not _scope_ok(a, b, level) or not _titles_ok(a, b, ma, mb, tier):
+                    return None
+                return level, sorted(shared)[0]
+        return None
+    if REVISION_TITLE_ONLY_FALLBACK and not ma["has_pn"] and not mb["has_pn"]:
+        wa, wb = ma["sig"][0], mb["sig"][0]
+        if (len(wa) >= 3 and _title_match(ma["sig"], mb["sig"], "strict") and _scope_ok(a, b, "title")
+                and ((ma["ustem"] and ma["ustem"] == mb["ustem"])
+                     or (a.get("source_page_url") and a.get("source_page_url") == b.get("source_page_url")))):
+            return "title", " ".join(sorted(wa))
+    return None
+
+
+def _days_between(newer: str, older: str) -> int:
+    return (_date.fromisoformat(newer) - _date.fromisoformat(older)).days
+
+
+def _supersedes(k: dict, r: dict, mk: dict, mr: dict) -> tuple[bool, str, str]:
+    """May newer row k replace older row r?  -> (ok, failed_gate, detail)."""
+    if (k["payer_name"], k["document_type"], k["state_or_region"]) != (r["payer_name"], r["document_type"], r["state_or_region"]):
+        return False, "G1_scope", ""
+    ident = _identity(k, r, mk, mr)
+    if not ident:
+        return False, "G2_identity", ""
+    level, ev = ident
+    if not _scope_ok(k, r, level):
+        return False, "G1_scope", ""
+    if _days_between(mk["upd"], mr["upd"]) < REVISION_MIN_GAP_DAYS:
+        return False, "G3_date_not_newer", ""
+    if level in ("stem", "core") and mk["ypn"] and mr["ypn"] and mk["ypn"] < mr["ypn"]:
+        return False, "G4_version_year_backwards", ""
+    today = _date.today().isoformat()
+    if (REVISION_KEEP_WHEN_NEWER_IS_PENDING and (k.get("effective_date") or "") > today
+            and r.get("effective_date") and r["effective_date"] <= today):
+        return False, "G5_newer_not_yet_effective", ""
+    return True, "", f"{level}:{ev}"
 
 
 def _revisions(rows: list[dict], removed: list[dict]) -> list[dict]:
-    """Dated revisions of one document: same payer + line of business + state + type + identity, different bytes.
-    identity = policy-number family (UHC year/suffix stripped) when the number is a real id (shared by <= 3 distinct
-    titles), else the normalised title (years / version words removed). Versions are ordered on ONE date field."""
-    titles_per_pn: dict[tuple[str, str], set] = defaultdict(set)
-    for r in rows:
-        if r["policy_number"]:
-            titles_per_pn[(r["payer_name"], r["policy_number"].upper())].add(_title_norm(r["document_title"]))
+    """Drop strictly older versions of the same document (see the header above). Everything else is kept."""
+    REVISION_AUDIT_LOG.clear()
+    meta = {id(r): _rev_meta(r) for r in rows}
+    elig = [r for r in rows if meta[id(r)]["upd"] and int(r["http_status"]) == 200 and r["requires_auth"] == "N"]
+    index: dict[tuple, list[dict]] = defaultdict(list)
+    for r in elig:
+        m = meta[id(r)]
+        for tier in "ESC":
+            for k in m["keys"][tier]:
+                index[(r["payer_name"], tier, k)].append(r)
+        if REVISION_TITLE_ONLY_FALLBACK and not m["has_pn"] and len(m["sig"][0]) >= 3:
+            index[(r["payer_name"], "T", " ".join(sorted(m["sig"][0])))].append(r)
 
-    def ident(r: dict) -> Optional[str]:
-        pn = r["policy_number"]
-        if pn and len(titles_per_pn[(r["payer_name"], pn.upper())]) <= 3:
-            return "policy " + _family(pn)
-        tn = _title_norm(r["document_title"])
-        if len(tn) >= 8 and len(tn.split()) >= 2:
-            return f"title '{tn}'"
-        return None
+    def neighbours(r: dict) -> list[dict]:
+        m, seen, out = meta[id(r)], {id(r)}, []
+        probes = [(t, k) for t in "ESC" for k in m["keys"][t]]
+        if REVISION_TITLE_ONLY_FALLBACK and not m["has_pn"] and len(m["sig"][0]) >= 3:
+            probes.append(("T", " ".join(sorted(m["sig"][0]))))
+        for t, k in probes:
+            for o in index.get((r["payer_name"], t, k), ()):
+                if id(o) not in seen:
+                    seen.add(id(o))
+                    out.append(o)
+        return out
 
-    groups: dict[tuple, list[dict]] = defaultdict(list)
-    for r in rows:
-        if int(r["http_status"]) != 200:
+    parent: dict[int, tuple[dict, str, str]] = {}      # id(removed row) -> (kept row, rule, reason)
+    audit = REVISION_AUDIT_LOG
+
+    # ---- same-date twins: one version published/re-saved twice. Keep the best-ranked copy, drop the rest - but only
+    #      when the twins are the same document AND their titles are close; otherwise both stay.
+    for r in sorted(elig, key=_rank):
+        if id(r) in parent:
             continue
-        i = ident(r)
-        if i:
-            groups[(r["payer_name"], r["line_of_business"], r["state_or_region"], r["document_type"], i)].append(r)
-    drop: set[int] = set()
-    for (_, _, _, _, label), g in groups.items():
-        if len(g) < 2:
-            continue
-        n_eff = sum(bool(r["effective_date"]) for r in g)
-        n_upd = sum(bool(r["last_updated_date"]) for r in g)
-        fld = "effective_date" if n_eff >= n_upd and n_eff > 0 else ("last_updated_date" if n_upd > 0 else "")
-        dated = sorted((r for r in g if fld and r[fld]), key=lambda r: r[fld], reverse=True)
-        top = dated[0][fld] if dated else ""
-        latest = [r for r in dated if r[fld] == top]
-        for r in g:
-            d = r[fld] if fld else ""
-            if not d:
-                status = f"no {fld or 'date'} printed - order unknown"
-            elif d == top and len(latest) > 1:
-                status = f"same {fld} as another version - possible duplicate, review"
-            elif d == top:
-                status = "latest"
-            else:
-                status = f"superseded by {latest[0]['document_url']}"
-            if REVISION_POLICY == "latest_only" and d and d < top and len(latest) == 1:
-                drop.add(id(r))
-                reason_text = f"Superseded by a newer revision. The kept document is dated {top} (field: {fld or 'n/a'})."
-                removed.append(_removed(latest[0], r, "superseded_revision", reason_text))
+        for p in sorted(neighbours(r), key=_rank):
+            mp, mr = meta[id(p)], meta[id(r)]
+            if id(p) in parent or mp["upd"] != mr["upd"] or _rank(p) < _rank(r):
                 continue
-            _add_note(r, f"revision group ({len(g)} versions of {label}, compared on {fld or 'n/a'}): {status}")
+            ident = _identity(r, p, mr, mp)
+            if ident and _title_match(mr["sig"], mp["sig"], "medium"):
+                parent[id(p)] = (r, "same_date_duplicate",
+                                 f"Same document ({ident[0]} match on '{ident[1]}') with the same last_updated_date {mr['upd']}; "
+                                 "kept the higher-ranked copy.")
+
+    # ---- strictly older versions: newest first, compared only with rows that are still in the output
+    order = sorted((r for r in elig if id(r) not in parent), key=lambda r: meta[id(r)]["upd"], reverse=True)
+    for r in order:
+        mr = meta[id(r)]
+        near = [k for k in neighbours(r) if id(k) not in parent and meta[id(k)]["upd"] > mr["upd"]]
+        passing, nearest_fail = [], ""
+        for k in near:
+            ok, gate, detail = _supersedes(k, r, meta[id(k)], mr)
+            if ok:
+                passing.append((k, detail))
+            elif not nearest_fail or gate > nearest_fail:
+                nearest_fail = gate
+        base_audit = {"payer_name": r["payer_name"], "document_url": r["document_url"], "title": r["document_title"],
+                      "policy_number": r["policy_number"], "last_updated_date": mr["upd"], "date_source": mr["src"]}
+        if not passing:
+            if near:
+                audit.append({**base_audit, "result": "kept", "why": nearest_fail or "no newer row", "other_url": near[0]["document_url"]})
+            continue
+        top = max(meta[id(k)]["upd"] for k, _ in passing)                  # newest passing row; ties -> best-ranked copy
+        best, detail = min(((k, d) for k, d in passing if meta[id(k)]["upd"] == top), key=lambda x: _rank(x[0]))
+        clash = [k for k, _ in passing if k is not best and not _identity(k, best, meta[id(k)], meta[id(best)])]
+        if clash:                                                           # G6
+            audit.append({**base_audit, "result": "kept", "why": "G6_ambiguous_matches_two_documents", "other_url": clash[0]["document_url"]})
+            continue
+        why = (f"Older revision of the same document ({detail}). Newer revision kept: last_updated_date "
+               f"{meta[id(best)]['upd']} vs {mr['upd']} (printed dates, effective_date not used). Gates passed: "
+               "trust, scope, identity, date, version, pending, unambiguous.")
+        parent[id(r)] = (best, "superseded_revision", why)
+        audit.append({**base_audit, "result": "removed", "why": "passed all gates", "other_url": best["document_url"]})
+
+    # ---- resolve every removal to the row that finally stays in the output, then report
+    def survivor(x: dict) -> dict:
+        while id(x) in parent:
+            x = parent[id(x)][0]
+        return x
+
+    drop: set[int] = set()
+    kept_count: dict[int, int] = defaultdict(int)
+    for r in rows:
+        if id(r) not in parent:
+            continue
+        keep, rule, why = parent[id(r)]
+        final = survivor(keep)
+        if REVISION_POLICY == "latest_only":
+            drop.add(id(r))
+            removed.append(_removed(final, r, rule, why + ("" if final is keep else f" (chain: newer still superseded by {final['document_url']})")))
+            kept_count[id(final)] += 1
+        else:                                                               # "flag": keep everything, only annotate
+            _add_note(r, f"older revision, superseded by {final['document_url']}")
+    for r in rows:
+        if kept_count.get(id(r)):
+            _add_note(r, f"latest revision ({meta[id(r)]['upd']}); {kept_count[id(r)]} older version(s) listed in near_duplicates_removed")
     return [r for r in rows if id(r) not in drop]
 
 
@@ -1105,6 +1380,7 @@ def build_rows(db: StateDB) -> tuple[list[dict], list[dict]]:
             home[p] = set(db.get(p, "home_domains", []))
         row["_fp"] = dec.get("text_fp", "") or ""
         row["_canon"] = dec.get("canonical_key", "") or ""
+        row["_upd_src"] = dec.get("upd_src", "") or "" 
         row["_owner"] = 0 if reg_domain(urlparse(row["document_url"]).hostname or "") in home[p] else 1
         rows.append(row)
     removed: list[dict] = []
@@ -1133,7 +1409,7 @@ def build_rows(db: StateDB) -> tuple[list[dict], list[dict]]:
     rows = _revisions(rows, removed)
     for r in rows:
         _refresh_missing_note(r)
-        for k in ("_fp", "_canon", "_owner"):
+        for k in ("_fp", "_canon", "_owner", "_upd_src"):
             r.pop(k, None)
         r["notes"] = join_notes([r["notes"].rstrip(".")], limit=NOTES_MAX_CHARS + 300)
     rows.sort(key=lambda r: (r["payer_name"], r["document_type"], r["document_title"].lower(), r["document_url"]))
@@ -1292,6 +1568,12 @@ def export(db: StateDB) -> None:
     _write_csv(summaries, list(summaries[0].keys()) if summaries else [], os.path.join(OUTPUT_DIR, "run_summary.csv"))
     _write_csv(removed, REMOVED_COLUMNS, os.path.join(OUTPUT_DIR, "near_duplicates_removed.csv"))
     
+    if REVISION_AUDIT_LOG:
+        _write_csv(REVISION_AUDIT_LOG,
+                   ["payer_name", "document_url", "title", "policy_number", "last_updated_date",
+                    "date_source", "result", "why", "other_url"],
+                   os.path.join(OUTPUT_DIR, "revision_audit.csv"))
+
     rej = []
     for r in db.con.execute("SELECT payer, document_url, row_json, decision FROM documents WHERE accepted=0"):
         row = json.loads(r["row_json"] or "{}")
