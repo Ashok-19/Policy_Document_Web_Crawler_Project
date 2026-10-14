@@ -89,7 +89,7 @@ def normalize_url(url: str, base: str = "") -> str:
         return ""
     port = port if port and not ((p.scheme == "http" and port == 80) or (p.scheme == "https" and port == 443)) else None
     netloc = f"{host}:{port}" if port else host
-    path = re.sub(r";jsessionid=[^/?#]*", "", p.path or "/", flags=re.I)
+    path = re.sub(r";(?:jsessionid|phpsessid|aspsessionid[a-z0-9]*|sessionid|cfid|cftoken)=[^/?#]*", "", p.path or "/", flags=re.I)
     path = re.sub(r"/{2,}", "/", path) or "/"
     query = urlencode([(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not _drop_param(k, v)], doseq=True)
     return urlunparse((p.scheme, netloc, path, "", query, ""))
@@ -103,7 +103,8 @@ def url_key(url: str) -> str:
     host = host[4:] if host.startswith("www.") else host
     port = f":{p.port}" if p.port and p.port not in (80, 443) else ""
     path = unquote(p.path or "/").rstrip("/") or "/"
-    q = urlencode(sorted((k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not _drop_param(k, v)))
+    # Lowercase keys and values to treat ?id=ABC and ?id=abc as the same URL
+    q = urlencode(sorted((k.lower(), v.lower()) for k, v in parse_qsl(p.query, keep_blank_values=True) if not _drop_param(k, v)))
     return f"{host}{port}{path}" + (f"?{q}" if q else "")
 
 

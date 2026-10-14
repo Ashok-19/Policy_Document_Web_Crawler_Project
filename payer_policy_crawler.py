@@ -982,8 +982,21 @@ def _collapse(rows: list[dict], keyfn: Callable[[dict], Any], rule: str, reason:
 
 def _family(pn: str) -> str:
     pn = pn.strip().upper()
-    m = re.fullmatch(r"20\d{2}([A-Z]\d{4})[A-Z0-9]{0,3}", pn)     # UHC 2025T0547R / 2026T0547S -> T0547
-    return m.group(1) if m else pn
+    # 1. UHC specific pattern
+    m = re.fullmatch(r"20\d{2}([A-Z]\d{4})[A-Z0-9]{0,3}", pn)
+    if m:
+        return m.group(1)
+    
+    # 2. Generic: Remove 4-digit years (19xx or 20xx) to group revisions like POL-2024-001 and POL-2023-001
+    stripped = re.sub(r"\b(?:19|20)\d{2}\b", "", pn)
+    # Clean up separators left behind by year removal
+    stripped = re.sub(r"[-_.\s]+", "-", stripped).strip("-")
+    # Remove trailing revision indicators like -R, -V, -A, -REV
+    stripped = re.sub(r"[-](?:R|V|REV|A|B|C|D|E)\d*$", "", stripped, flags=re.I)
+    
+    if stripped and len(stripped) >= 2:
+        return stripped
+    return pn
 
 
 def _title_norm(t: str) -> str:

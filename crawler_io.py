@@ -476,6 +476,12 @@ class FetchResult:
     last_modified: str = ""        # HTTP Last-Modified as YYYY-MM-DD
     content_encoding: str = ""
 
+MAINTENANCE_RX = re.compile(
+    rb"(?:under\s+maintenance|site\s+maintenance|we'?ll\s+be\s+back\s+soon|temporarily\s+unavailable|"
+    rb"scheduled\s+maintenance|we\s+are\s+currently\s+undergoing|maintenance\s+mode|"
+    rb"briefly\s+unavailable|down\s+for\s+maintenance|back\s+shortly)", re.I
+)
+
 
 WAF_SIGNATURES = [   # used on 403 / 429 / 503 responses
     ("cloudflare", re.compile(rb"cf-chl|challenge-platform|cf_chl_opt|just a moment\.\.\.|attention required! \| cloudflare", re.I)),
@@ -536,6 +542,14 @@ def classify_block(status: int, original_url: str, final_url: str, body: bytes) 
             if host_has_suffix(fp.hostname or "", IDP_HOST_SUFFIXES) or (
                 LOGIN_URL_RX.search(f"{fp.path}?{fp.query}") and not LOGIN_URL_RX.search(urlparse(original_url).path)):
                 return "login_redirect"
+
+        # Detect transient "200 OK" maintenance pages
+        if b"<" in head[:2000]:
+            vis = _visible_text_len(head)
+            n_links = len(re.findall(rb"<a\s", head, re.I))
+            if vis < 2500 and n_links < 20 and MAINTENANCE_RX.search(head[:15000]):
+                return "maintenance_page"
+
         if status == 200 and len(body) < 40000:
             for vendor, rx in WAF_SIGNATURES_200:
                 if rx.search(head):
@@ -894,14 +908,54 @@ class Browser:
                 out.main_body = resp.body() if resp else b""
             except Exception:
                 out.main_body = b""
+
             out.final_url = normalize_url(page.url) or page.url
+        
+            # Pierce Shadow DOM so selectolax can parse it
+            shadow_dom_js = """
+            () => {
+                const processNode = (node) => {
+                    if (!node) return;
+                    const children = node.querySelectorAll ? node.querySelectorAll('*') : [];
+                    for (const el of children) {
+                        if (el.shadowRoot) {
+                            const wrapper = document.createElement('div');
+                            wrapper.setAttribute('data-shadow-dom-pierced', 'true');
+                            wrapper.innerHTML = el.shadowRoot.innerHTML;
+                            document.body.appendChild(wrapper);
+                            processNode(el.shadowRoot);
+                        }
+                    }
+                };
+                processNode(document);
+            }
+            """
+            try:
+                page.evaluate(shadow_dom_js)
+            except Exception:
+                pass
+                
             html = page.content()
+
             out.blocked = classify_block(out.status or 200, url, out.final_url, html.encode("utf-8", "ignore"))
             self._add_snapshot(out, "", html, seen)
             if out.blocked:
                 return out
             self._lazy_scroll(page)
             self._add_snapshot(out, "", page.content(), seen)
+            
+            # Capture HTML iframes and inject base tags for relative link resolution
+            for frame in page.frames:
+                if frame != page.main_frame:
+                    try:
+                        iframe_html = frame.content()
+                        iframe_url = frame.url
+                        if iframe_html and iframe_url:
+                            if "<base" not in iframe_html.lower():
+                                iframe_html = f'<base href="{iframe_url}">\n' + iframe_html
+                            self._add_snapshot(out, f"iframe:{iframe_url}", iframe_html, seen)
+                    except Exception:
+                        continue
             self._expand(page, out, seen)
             self._click_tabs(page, out, seen)
             self._paginate(page, out, seen)
@@ -909,12 +963,21 @@ class Browser:
             for r in responses[:400]:
                 try:
                     ct = (r.headers or {}).get("content-type", "")
-                    if "json" not in ct.lower() or r.status >= 400:
+                    if r.status >= 400:
                         continue
-                    body = r.text()
-                    if len(body) > 8_000_000:
-                        continue
-                    out.json_payloads.append((normalize_url(r.url) or r.url, json.loads(body)))
+                    if "json" in ct.lower():
+                        body = r.text()
+                        if len(body) > 8_000_000:
+                            continue
+                        out.json_payloads.append((normalize_url(r.url) or r.url, json.loads(body)))
+                    elif "html" in ct.lower() or "xml" in ct.lower():
+                        body = r.text()
+                        if len(body) > 8_000_000:
+                            continue
+                        # Inject base tag so relative links inside XHR HTML resolve correctly
+                        if "<base" not in body.lower():
+                            body = f'<base href="{r.url}">\n' + body
+                        self._add_snapshot(out, f"xhr_html:{r.url}", body, seen)
                 except Exception:
                     continue
         except Exception as e:
