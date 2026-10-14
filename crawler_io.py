@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover
 from crawler_config import (BLOCK_TRACKER_REQUESTS_IN_BROWSER, FETCH_WORKERS, TRACKER_HOST_SUFFIXES, CONTACT, IDP_HOST_SUFFIXES, MAX_CRAWL_DELAY_SECONDS, MAX_EXPAND_CLICKS, MAX_PAGINATION_STEPS, MAX_PARSE_BYTES, MAX_RETRIES, MAX_SELECT_OPTIONS, MAX_SNAPSHOTS, MAX_STREAM_BYTES, MAX_TAB_CLICKS, PLAYWRIGHT_NAV_TIMEOUT_MS, REQUEST_DELAY_SECONDS, REQUEST_TIMEOUT_SECONDS, RETRY_STATUSES, TEXT_FP_MAX_PAGES, USER_AGENT, USE_OCR, USE_PLAYWRIGHT, log, utc_now_iso)
 from crawler_text import (DOC_EXTS, MAYBE_DOC_HINTS, clean_text, clean_text_keep_lines, host_has_suffix, is_cdn_host, http_date_to_iso, is_good_title, link_kind, normalize_url, parse_date, sha256_hex, trim_title, url_ext, url_key)
 
+from playwright.sync_api import sync_playwright
 
 # =============================================================================
 # 8. CONTENT INSPECTION (Gate 2 data source)
@@ -511,7 +512,8 @@ WAF_SIGNATURES_200 = [   # 200 responses: only unmistakable interstitials (norma
     ("imperva", re.compile(rb"_incapsula_resource", re.I)),
     ("perimeterx", re.compile(rb"px-captcha", re.I)),
     ("datadome", re.compile(rb"geo\.captcha-delivery", re.I)),
-    ("generic_captcha", re.compile(rb"pardon our interruption|verify you are (?:a )?human|are you a robot", re.I)),
+    ("radware", re.compile(rb"perfdrive\.com|radware|access denied", re.I)), # <-- ADDED: Catches Radware challenges
+    ("generic_captcha", re.compile(rb"pardon our interruption|verify you are (?:a )?human|are you a robot|captcha", re.I)),
 ]
 LOGIN_URL_RX = re.compile(r"(?:^|[/._\-?=])(log-?in|sign-?in|signon|sso|auth(?:orize|enticate)?|oauth2?|saml|idp|account/login|"
                           r"logon|b2c_1|myaccount|login\.aspx|identity)(?:[/._\-?=&]|$)", re.I)
@@ -856,11 +858,29 @@ class Browser:
         if not self.available:
             return False
         try:
-            from playwright.sync_api import sync_playwright
+            
             self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
-            self._ctx = self._browser.new_context(extra_http_headers={"From": CONTACT}, accept_downloads=False,
-                                                  viewport={"width": 1366, "height": 900})
+            
+            # FIX: Added stealth args to bypass basic automation detection (mimics your working script)
+            self._browser = self._pw.chromium.launch(
+                headless=True, 
+                args=[
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ]
+            )
+            
+            # FIX: Added realistic context properties to mimic a genuine user
+            self._ctx = self._browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1366, "height": 800},
+                locale="en-US",
+                timezone_id="America/New_York",
+                extra_http_headers={"From": CONTACT}, 
+                accept_downloads=False,
+                ignore_https_errors=True
+            )
             self._ctx.route("**/*", self._route_filter)
             log(logging.INFO, "browser_started")
             return True
@@ -912,11 +932,34 @@ class Browser:
         seen: set = set()
         try:
             out.fetched_at = utc_now_iso()
+            resp = None
+            
+            # FIX 1: Use "domcontentloaded" to avoid the "networkidle" trap on sites with continuous telemetry/WebSockets
             try:
-                resp = page.goto(url, wait_until="networkidle", timeout=PLAYWRIGHT_NAV_TIMEOUT_MS)
-            except Exception:
                 resp = page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_NAV_TIMEOUT_MS)
-                page.wait_for_timeout(3000)
+            except Exception:
+                # Fallback to "commit" if domcontentloaded still struggles (rare, but safe)
+                try:
+                    resp = page.goto(url, wait_until="commit", timeout=PLAYWRIGHT_NAV_TIMEOUT_MS)
+                except Exception:
+                    pass # Proceed with whatever the page managed to load
+
+            # FIX 2: Wait for the main body to be present to ensure basic DOM is ready
+            try:
+                page.wait_for_selector("body", timeout=10000)
+            except Exception:
+                pass
+
+            # FIX 3: Mimic human behavior: delay to let JS challenges (like Radware/Akamai) resolve
+            page.wait_for_timeout(3000)
+            
+            # FIX 4: Mimic a slight scroll to trigger lazy-loaded content and human telemetry
+            try:
+                page.evaluate("window.scrollBy(0, 300)")
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
             self.renders += 1
             out.status = resp.status if resp else 0
             try:
