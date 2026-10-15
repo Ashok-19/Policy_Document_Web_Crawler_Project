@@ -667,38 +667,41 @@ class Fetcher:
         log(logging.DEBUG, "robots_loaded", origin=origin, status=note)
         return rp
 
+    # def allowed(self, url: str) -> bool:
+    #     host = urlparse(url).hostname or ""
+        
+    #     # 1. Bypass robots.txt check for known CDN hosts.
+    #     if is_cdn_host(host):
+    #         return True
+            
+    #     low_url = url.lower()
+        
+    #     # 2. DYNAMIC BYPASS: 3-Layer Safety Net for Documents
+        
+    #     # Layer A: Extension is at the very end (e.g., /file.pdf)
+    #     ext = url_ext(url)
+    #     if ext in DOC_EXTS:
+    #         return True
+            
+    #     # Layer B: Extension appears ANYWHERE in the URL 
+    #     # (e.g., /pdf/document-name or /api/file.docx/download)
+    #     # This guarantees we catch mid-URL extensions that url_ext() might miss.
+    #     if re.search(r"\.(pdf|docx?|xlsx?|csv|rtf|txt)\b", low_url):
+    #         return True
+            
+    #     # Layer C: Common document repository keywords anywhere in the URL
+    #     # (e.g., /content/dam/, /documents/, getdocument, etc.)
+    #     if any(hint in low_url for hint in MAYBE_DOC_HINTS):
+    #         return True
+
+    #     # 3. For regular HTML pages, strictly respect robots.txt
+    #     rp = self.robots_for(url)
+    #     return True if rp is None else rp.can_fetch(url, USER_AGENT)
+
     def allowed(self, url: str) -> bool:
-        host = urlparse(url).hostname or ""
-        
-        # 1. Bypass robots.txt check for known CDN hosts.
-        if is_cdn_host(host):
-            return True
-            
-        low_url = url.lower()
-        
-        # 2. DYNAMIC BYPASS: 3-Layer Safety Net for Documents
-        
-        # Layer A: Extension is at the very end (e.g., /file.pdf)
-        ext = url_ext(url)
-        if ext in DOC_EXTS:
-            return True
-            
-        # Layer B: Extension appears ANYWHERE in the URL 
-        # (e.g., /pdf/document-name or /api/file.docx/download)
-        # This guarantees we catch mid-URL extensions that url_ext() might miss.
-        if re.search(r"\.(pdf|docx?|xlsx?|csv|rtf|txt)\b", low_url):
-            return True
-            
-        # Layer C: Common document repository keywords anywhere in the URL
-        # (e.g., /content/dam/, /documents/, getdocument, etc.)
-        if any(hint in low_url for hint in MAYBE_DOC_HINTS):
-            return True
-
-        # 3. For regular HTML pages, strictly respect robots.txt
-        rp = self.robots_for(url)
-        return True if rp is None else rp.can_fetch(url, USER_AGENT)
-
-
+        # COMPLETE BYPASS: As per architectural requirement, robots.txt 
+        # is ignored for ALL links (home, external, documents, and HTML pages).
+        return True
 
     def sitemaps_from_robots(self, url: str) -> list[str]:
         rp = self.robots_for(url)

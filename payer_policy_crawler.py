@@ -744,11 +744,32 @@ class PayerCrawler:
             return False
         return named
 
-    def _brand_named(self, ins: Inspection, anchor: str) -> bool:
-        head = " ".join([ins.heading_title, ins.meta_title, " ".join(ins.titles), anchor, (ins.text or "")[:1500]])
-        body = " ".join([(ins.text or "")[1500:6000], (ins.fp_text or "")[-3000:]])
-        return self._names_payer(head, body)
+    def _brand_named(self, ins: Inspection, anchor: str, heading: str = "", page_ctx: str = "", source_url: str = "") -> bool:
+        """Check if the document or its linking context names the payer.
+        FIX 1: Search the ENTIRE extracted text (fp_text), not just the first/last slices.
+               This fixes the gap where the brand name is in the middle or end of a multi-page PDF.
+        FIX 2: Include linking page context (heading, page_ctx, source_url). 
+               Payers frequently host policies on third-party sites where the payer's name is only 
+               present in the URL or the linking page, but not the document body.
+        """
+        # Combine all evidence sources into a single blob
+        full_text = ins.fp_text or ins.text or ""
+        context_blob = " ".join([
+            ins.heading_title or "",
+            ins.meta_title or "",
+            " ".join(ins.titles) if ins.titles else "",
+            anchor or "",
+            heading or "",
+            page_ctx or "",
+            source_url or "",
+            full_text
+        ])
+        
+        # Pass the entire blob as 'head' so weak brands are accepted if found anywhere in the combined context/text.
+        # _names_payer will still apply its safeguards (e.g., checking if competitor brands outnumber this brand).
+        return self._names_payer(context_blob, "")
 
+    
     def _note_declared(self, item: dict, page_url: str, htmls: list) -> None:
         """Remember how many entries a hub page says it holds ('Showing 1-20 of 523'); hub_coverage() compares at export."""
         if float(item.get("link_score") or 0) < HUB_INHERIT_MIN_SCORE:
@@ -879,9 +900,16 @@ class PayerCrawler:
             else:
                 return reject(f"hosted on CDN {tenant}, not yet trusted for {self.name}, and does not name {self.name}")
         elif dom not in self.home_domains:
-            if not self._brand_named(ins, anchor):
+            # Pass the full context to _brand_named to allow acceptance based on linking page or full document text
+            if not self._brand_named(
+                ins, 
+                anchor, 
+                item.get("heading", ""), 
+                item.get("page_ctx", ""), 
+                item.get("source_page_url", "")
+            ):
                 return reject(f"hosted on {dom} and does not name {self.name}")
-            notes.append(f"hosted on {dom} (payer named in the document)")
+            notes.append(f"hosted on {dom} (payer named in document or linking context)")
             penalty += 0.05
 
         # -------- decision (Gate 1 + Gate 2, Gate 3 when ambiguous)

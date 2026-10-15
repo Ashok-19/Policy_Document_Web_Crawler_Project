@@ -118,7 +118,7 @@ MAYBE_DOC_MIN_SCORE = 5.0         # extension-less "maybe document" links need m
 EXTERNAL_DOC_MIN_SCORE = 5.0      # documents on hosts the payer does not own need more evidence
 PAGE_FOLLOW_MIN_SCORE = 2.0       # HTML pages at/above this are crawled
 NAV_FOLLOW_MIN_SCORE = 0.5        # depth-1 navigation links from the homepage
-RELATED_DOMAIN_MIN_SCORE = 8.5    # off-domain page must score this to open a related domain
+RELATED_DOMAIN_MIN_SCORE = 7    # off-domain page must score this to open a related domain
 # A new related domain is on trial: it is promoted after RELATED_TRIAL_MIN_DOCS accepted documents and dropped (its pending
 # pages skipped) when RELATED_TRIAL_BRAND_PAGES pages never name the payer or RELATED_TRIAL_MAX_PAGES pages gave too few documents.
 RELATED_TRIAL_MIN_DOCS = 2
