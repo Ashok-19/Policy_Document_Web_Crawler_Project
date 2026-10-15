@@ -320,7 +320,7 @@ def _mt(text: str, name: str) -> tuple[float, list[str]]:
 
 
 def score_link(url: str, anchor: str = "", heading: str = "", parent: str = "", page: str = "",
-               is_page: bool = False) -> tuple[float, list[str]]:
+               is_page: bool = False, from_sitemap: bool = False) -> tuple[float, list[str]]:
     """Gate 1: weighted keyword score from URL, link text and surrounding context."""
     fields = {"anchor": anchor, "url": url_words(url) if url else "", "heading": heading, "parent": parent, "page": page}
     score, signals = 0.0, []
@@ -344,11 +344,29 @@ def score_link(url: str, anchor: str = "", heading: str = "", parent: str = "", 
             total = min(total, 3.0) if total > 0 else total
         score += total * FIELD_WEIGHTS[name]
         signals += [f"{name}:{h}" for h in ph + nh]
-    if url and url_ext(url) in DOC_EXTS and score > 0:
+        
+    # FIX 1: Allow extension bonus even if keyword score is 0 (but not negative)
+    # Previously, score > 0 prevented generic URLs like /docs/12345.pdf from getting the bonus.
+    if url and url_ext(url) in DOC_EXTS and score >= 0:
         score += 1.5
         signals.append(f"ext:{url_ext(url)}")
-    return round(score, 2), signals[:12]
+        
+    # FIX 2: Document Repository Path Bonus
+    # URLs in known document repositories are highly likely to be valid policies, 
+    # even if the filename is generic. This filters out noisy links in /images/ or /assets/.
+    low_url = url.lower()
+    if re.search(r"/(?:documents?|polic(?:y|ies)|media|files?|dam|forms?|guidelines?|docs)/", low_url):
+        score += 2.0
+        signals.append("repo_path")
 
+    # FIX 3: Sitemap Discovery Bonus
+    # Sitemaps are curated by the site owner. A document found here is explicitly 
+    # declared as important indexable content, reducing the noise risk.
+    if from_sitemap and url_ext(url) in DOC_EXTS:
+        score += 1.5
+        signals.append("sitemap_doc")
+        
+    return round(score, 2), signals[:12]
 
 _DECLARED_RX = [
     re.compile(r"\d[\d,]*\s*(?:-|–|to)\s*\d[\d,]*\s+of\s+([\d,]{2,9})\b", re.I),                       # 1-20 of 523

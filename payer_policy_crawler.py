@@ -268,6 +268,7 @@ class PayerCrawler:
                 children = sorted(entries, key=lambda e: -score_link(e[0], is_page=True)[0])
                 queue = [(c[0], this_path) for c in children] + queue
                 continue
+
             for loc, lastmod in entries:
                 n_urls += 1
                 u = normalize_url(loc)
@@ -277,16 +278,33 @@ class PayerCrawler:
                 kindu = link_kind(u)
                 if kindu in ("junk", "sitemap"):
                     continue
-                sc, sig = score_link(u, is_page=(kindu == "page"))
+                
+                # FIX 4: Pass from_sitemap=True to leverage the new sitemap bonus
+                sc, sig = score_link(u, is_page=(kindu == "page"), from_sitemap=True)
                 hints: dict[str, str] = {"_via": "sitemap"}
                 if lastmod:
                     hints["sitemap_lastmod"] = lastmod
-                if kindu in ("doc", "maybe_doc") and sc >= DOC_CANDIDATE_MIN_SCORE and dom in self.home_domains:
-                    self._enqueue_doc(u, kindu, sc, sig, "", f"{this_path} > url({u})", 1, "", "", "", hints, "sitemap")
+                    
+                if kindu in ("doc", "maybe_doc") and dom in self.home_domains:
+                    
+                    # FIX 5: Smart Sitemap Rescue Fallback
+                    # If a home-domain document from a sitemap still falls below the threshold 
+                    # (e.g., due to negative keywords), but has a valid extension, we rescue it.
+                    # Sitemaps are curated by the webmaster, so the noise risk is minimal.
+                    if sc < DOC_CANDIDATE_MIN_SCORE and url_ext(u) in DOC_EXTS:
+                        sc = DOC_CANDIDATE_MIN_SCORE
+                        sig.append("sitemap_rescue_fallback")
+                        
+                    # Now enqueue if it meets the threshold
+                    if sc >= DOC_CANDIDATE_MIN_SCORE:
+                        self._enqueue_doc(u, kindu, sc, sig, "", f"{this_path} > url({u})", 1, "", "", "", hints, "sitemap")
+                        
                 elif kindu == "page" and dom in self.home_domains and sc >= PAGE_FOLLOW_MIN_SCORE + 1:
                     self.db.enqueue(self.name, dict(url=u, kind="page", priority=sc, depth=1, budget=MAX_DEPTH - 1,
-                                                    source_page_url="", discovery_path=f"{this_path} > page({u})",
-                                                    link_score=sc, signals=sig, route="sitemap", hints=hints))
+                    source_page_url="", discovery_path=f"{this_path} > page({u})",
+                    link_score=sc, signals=sig, route="sitemap", hints=hints))
+
+            
             self.db.commit()
         log(logging.INFO, "sitemaps_done", payer=self.name, sitemap_files=n_files, urls_seen=n_urls)
         self.db.mark_phase(self.name, "sitemaps")
